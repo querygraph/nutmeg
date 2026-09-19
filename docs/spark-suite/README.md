@@ -26,12 +26,21 @@ package built by `env SPARK_VERSION=3.5.9 scripts/spark-tests/build-pyspark.sh`.
 Sail carries test patches for Spark 3.5.9 and 4.2.0 only, so 3.5.9 is the
 3.5 line the gate uses.
 
+## Why the script checks the port
+
+The first three attempts produced reports that meant nothing. A server
+leaked by an aborted run kept the port, every later server failed to bind
+with `Address already in use`, and the tests silently talked to the leaked
+one, so the branch was compared against itself. The script now refuses to
+start a suite when the port is already open, verifies that the server it
+started is alive before and after the suite, records which binary served
+each run in `<run>/binary`, and stops the server with escalation before the
+next one. A report is only trustworthy when both `binary` files name the
+binaries you intended.
+
 ## Runs
 
-- `session-factory-hook-py313.md` — the first run of the
-  `session-factory-hook` branch against base `20f4de4f`. Empty passed-test
-  diff and identical counts in all five suites. Caveat: the server binaries
-  embedded Python 3.13 while the tests ran on 3.11, so 394 user-defined
-  function tests errored on a version mismatch on both sides. Superseded by
-  the run below, which builds both binaries with
-  `PYO3_PYTHON=<test venv>/bin/python`.
+- `session-factory-hook.md` — the `session-factory-hook` branch against
+  base `20f4de4f`, both built with
+  `PYO3_PYTHON=<test venv>/bin/python` so the Python user-defined function
+  tests run on the same interpreter as the tests.

@@ -39,4 +39,11 @@ The full Spark compatibility suite (`scripts/spark-tests/run-tests.sh`,
 default suites, patched PySpark 3.5.9) was run against a release server
 built from this branch and against one built from the base commit, and the
 results compared with `scripts/spark-tests/generate-test-report.sh`. The
-report is in the comment below.
+results compared with `scripts/spark-tests/generate-test-report.sh`.
+
+The passed-test difference is empty and every suite's counts are identical:
+`test-connect` 896 passed, 106 failed, 170 skipped on both sides, and the
+four doctest suites unchanged. The only differences in the error listing are
+two randomly named in-memory databases in an assertion message. Both
+binaries were release builds against the test environment's Python 3.11 so
+that the Python UDF tests actually execute.
