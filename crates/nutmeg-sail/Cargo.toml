@@ -1,0 +1,20 @@
+[package]
+name = "nutmeg-sail"
+description = "The nutmeg Spark data source and session mutator for Sail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+nutmeg-graph = { path = "../nutmeg-graph" }
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+arrow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+sail-common-datafusion = { workspace = true }
+sail-session = { workspace = true }
