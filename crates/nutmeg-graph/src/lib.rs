@@ -713,11 +713,15 @@ fn probe_args(algorithm: &str, orientation: Option<&str>) -> Result<ValidatedArg
         options.insert("orientation".into(), serde_json::json!(orientation));
     }
     let definition = definition_of(algorithm)?;
+    // Successive node arguments name different probe nodes: a kernel that takes
+    // a source and a target, such as max flow, refuses the same node twice.
+    let mut ids = ["a", "b", "c"].into_iter().cycle();
     for (index, argument) in definition.arguments.iter().enumerate() {
         if Some(index) != definition.options_argument {
+            let id = ids.next().unwrap_or("a");
             let value = match argument.field.value_type {
-                ValueType::Strings => serde_json::json!(["a"]),
-                _ => serde_json::json!("a"),
+                ValueType::Strings => serde_json::json!([id]),
+                _ => serde_json::json!(id),
             };
             options.insert(argument.field.name.clone(), value);
         }
