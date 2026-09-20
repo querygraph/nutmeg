@@ -39,7 +39,9 @@ fn names_resolve_in_either_spelling() {
     assert_eq!(resolve_algorithm("shortest_paths"), Some("shortestPaths"));
     assert_eq!(resolve_algorithm("shortestPaths"), Some("shortestPaths"));
     assert_eq!(resolve_algorithm("PAGERANK"), Some("pagerank"));
-    assert_eq!(resolve_algorithm("louvain"), None);
+    // Louvain stood here as the unknown name until Grust registered it.
+    assert_eq!(resolve_algorithm("louvain"), Some("louvain"));
+    assert_eq!(resolve_algorithm("not_an_algorithm"), None);
     assert_eq!(snake("multiSourceBfs"), "multi_source_bfs");
 }
 
