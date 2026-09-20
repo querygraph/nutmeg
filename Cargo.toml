@@ -35,7 +35,7 @@ once_cell = "1"
 # dependencies on the sibling checkout while Nutmeg is developed against
 # unreleased Grust; a published version replaces these at the first release.
 grust-algorithms = { path = "../grust/crates/grust-algorithms", features = ["arrow"] }
-grust-algorithm-procedures = { path = "../grust/crates/grust-algorithm-procedures" }
+grust-algorithm-procedures = { path = "../grust/crates/grust-algorithm-procedures", features = ["arrow"] }
 grust-procedures = { path = "../grust/crates/grust-procedures" }
 grust-core = { path = "../grust/crates/grust-core" }
 

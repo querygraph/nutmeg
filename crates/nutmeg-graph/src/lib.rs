@@ -38,10 +38,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_common::{DataFusionError, Result, ScalarValue, exec_err, plan_err};
 use datafusion_expr::{Expr, TableType};
 use grust_algorithms::{
-    ArrowResultCursor, CsrEstimate, GraphProjection, MissingWeight, Orientation, PageRankOptions,
-    ProjectionOptions, WeightSelection, bfs, degree, depth_first, dijkstra, multi_source_bfs,
-    pagerank, shortest_paths, strongly_connected_components, topological_sort,
-    weakly_connected_components,
+    ArrowResultCursor, CsrEstimate, GraphProjection, ProjectionOptions, WeightSelection,
 };
 use grust_core::Value;
 use grust_procedures::{
@@ -532,44 +529,10 @@ fn projection_key(args: &ValidatedArguments) -> String {
     format!("{picked:?}")
 }
 
-// Mirrors grust-algorithm-procedures' private `options::projection`; the
-// values arrive already typed and defaulted by Grust's validator.
+// Grust's own reading of the projection options, so a projection built here
+// means what the registered procedure's would.
 fn projection_options(args: &ValidatedArguments) -> Result<ProjectionOptions<'_>> {
-    let get = |key: &str| args.options().get(key).unwrap_or(&Value::Null);
-    let orientation = match get("orientation") {
-        Value::String(s) if s == "outgoing" => Orientation::Outgoing,
-        Value::String(s) if s == "incoming" => Orientation::Incoming,
-        Value::String(s) if s == "undirected" => Orientation::Undirected,
-        other => {
-            return plan_err!(
-                "nutmeg: orientation must be outgoing, incoming or undirected, got {other:?}"
-            );
-        }
-    };
-    let labels = |key: &str| -> Result<Option<&[String]>> {
-        match get(key) {
-            Value::Null => Ok(None),
-            Value::StringArray(values) => Ok(Some(values.as_slice())),
-            other => plan_err!("nutmeg: {key} must be a string array, got {other:?}"),
-        }
-    };
-    let missing = match get("defaultWeight") {
-        Value::Null => MissingWeight::Reject,
-        Value::Float(v) => MissingWeight::Default(*v),
-        Value::Int(v) => MissingWeight::Default(*v as f64),
-        other => return plan_err!("nutmeg: defaultWeight must be a number, got {other:?}"),
-    };
-    let weight = match get("weightProperty") {
-        Value::Null if missing == MissingWeight::Reject => WeightSelection::Unit,
-        Value::String(key) => WeightSelection::Property { key, missing },
-        _ => return plan_err!("nutmeg: defaultWeight requires weightProperty"),
-    };
-    Ok(ProjectionOptions {
-        node_labels: labels("nodeLabels")?,
-        relationship_labels: labels("relationshipTypes")?,
-        orientation,
-        weight,
-    })
+    grust_algorithm_procedures::projection_options(args).map_err(err)
 }
 
 fn json_text(value: serde_json::Value) -> String {
@@ -728,10 +691,6 @@ pub fn run(
     }
     let graph = Registry::projection(graph_name, args)?;
     let g = &graph;
-    let source = || match args.positional().first() {
-        Some(Value::String(s)) => Ok(s.as_str()),
-        _ => plan_err!("nutmeg: `{algorithm}` needs `source`"),
-    };
     let cursor = match algorithm {
         "projectionStats" => {
             let s = g.statistics().map_err(err)?;
@@ -740,62 +699,19 @@ pub fn run(
                 &[s.nodes, s.edges, s.arcs, s.self_loops, s.csr_bytes],
             );
         }
-        "degree" => degree(g).map_err(err)?.into_arrow_results(),
-        "bfs" => bfs(g, source()?).map_err(err)?.into_arrow_results(),
-        "dfs" => depth_first(g, source()?).map_err(err)?.into_arrow_results(),
-        "dijkstra" => dijkstra(g, source()?).map_err(err)?.into_arrow_results(),
-        "shortestPaths" => shortest_paths(g, source()?)
-            .map_err(err)?
-            .into_arrow_results()
-            .map_err(err)?,
-        "multiSourceBfs" => {
-            let Some(Value::StringArray(sources)) = args.positional().first() else {
-                return plan_err!("nutmeg: `multiSourceBfs` needs `sources`");
-            };
-            multi_source_bfs(g, sources)
-                .map_err(err)?
-                .into_arrow_results()
-        }
-        "wcc" => weakly_connected_components(g)
-            .map_err(err)?
-            .into_arrow_results(),
-        "scc" => strongly_connected_components(g)
-            .map_err(err)?
-            .into_arrow_results(),
-        "topologicalSort" => topological_sort(g).map_err(err)?.into_arrow_results(),
-        "pagerank" => {
-            let number = |key: &str| match args.options().get(key) {
-                Some(Value::Float(v)) => Ok(*v),
-                Some(Value::Int(v)) => Ok(*v as f64),
-                other => plan_err!("nutmeg: pagerank {key}: {other:?}"),
-            };
-            let max_iterations = match args.options().get("maxIterations") {
-                Some(Value::Int(v)) if *v > 0 => *v as usize,
-                other => return plan_err!("nutmeg: pagerank maxIterations: {other:?}"),
-            };
-            let personalization = match args.options().get("personalization") {
-                Some(Value::FloatArray(values)) => Some(values.as_slice()),
-                _ => None,
-            };
-            let options = PageRankOptions {
-                damping: number("damping")?,
-                tolerance: number("tolerance")?,
-                max_iterations,
-                personalization,
-            };
-            pagerank(g, options).map_err(err)?.into_arrow_results()
-        }
-        other => {
-            return exec_err!(
-                "nutmeg: Grust registers `{other}` but this Nutmeg build has no dispatch arm for it"
-            );
-        }
+        // Every projection kernel Grust registers, by name: Grust finds the
+        // kernel, reads its options and returns its typed Arrow results, so a
+        // new registration is served here with no code of Nutmeg's own.
+        _ => grust_algorithm_procedures::run_on_projection(algorithm, g, args).map_err(err)?,
     };
     drain(cursor)
 }
 
-fn probe_args(algorithm: &str) -> Result<ValidatedArguments> {
+fn probe_args(algorithm: &str, orientation: Option<&str>) -> Result<ValidatedArguments> {
     let mut options = serde_json::Map::new();
+    if let Some(orientation) = orientation {
+        options.insert("orientation".into(), serde_json::json!(orientation));
+    }
     let definition = definition_of(algorithm)?;
     for (index, argument) in definition.arguments.iter().enumerate() {
         if Some(index) != definition.options_argument {
@@ -839,7 +755,16 @@ pub fn output_schema(algorithm: &str) -> Result<SchemaRef> {
             true,
         )?;
     }
-    let batches = run(algorithm, PROBE, &probe_args(algorithm)?)?;
+    // A kernel defined on undirected graphs refuses the default directed
+    // projection, and says so; probe it on an undirected one instead.
+    let batches = match run(algorithm, PROBE, &probe_args(algorithm, None)?) {
+        Err(error) if error.to_string().contains("undirected") => run(
+            algorithm,
+            PROBE,
+            &probe_args(algorithm, Some("undirected"))?,
+        )?,
+        other => other?,
+    };
     let Some(first) = batches.first() else {
         return exec_err!("nutmeg: probing `{algorithm}` produced no batch");
     };
