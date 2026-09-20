@@ -23,6 +23,12 @@ grust-algorithm-procedures = { workspace = true }
 grust-procedures = { workspace = true }
 grust-core = { workspace = true }
 
+[features]
+# The SQL surface, for tests that go through `ctx.sql`. Off by default because
+# DataFusion's `sql` feature adds an error variant that Sail's exhaustive match
+# over `DataFusionError` does not cover, so a build that enables it cannot also
+# build `nutmeg-sail`. Nutmeg's own SQL table functions do not need it.
+sql = ["datafusion/sql"]
+
 [dev-dependencies]
-datafusion = { workspace = true, features = ["sql"] }
 tokio = { workspace = true }

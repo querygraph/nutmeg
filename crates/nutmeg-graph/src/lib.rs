@@ -437,11 +437,15 @@ impl Registry {
 
     /// The projection of `name` under the projection options in `args`,
     /// built on first use and kept until the graph is staged again.
-    pub fn projection(name: &str, args: &ValidatedArguments) -> Result<GraphProjection> {
+    pub fn projection(
+        name: &str,
+        args: &ValidatedArguments,
+        concurrency: Option<usize>,
+    ) -> Result<GraphProjection> {
         let Some(entry) = Self::entry(name, false)? else {
             return exec_err!("nutmeg: no graph named `{name}`; stage its rows first");
         };
-        let key = projection_key(args);
+        let key = format!("{}/{concurrency:?}", projection_key(args));
         if let Some(found) = entry.read().map_err(|_| poisoned())?.projections.get(&key) {
             return Ok(found.clone());
         }
@@ -463,6 +467,10 @@ impl Registry {
             deadline: None,
         })
         .map_err(err)?;
+        let context = match concurrency {
+            Some(workers) => context.with_concurrency(workers).map_err(err)?,
+            None => context,
+        };
         let identity = SnapshotIdentity::new(
             name.to_string(),
             format!("r{}", e.revision),
@@ -540,6 +548,33 @@ fn json_text(value: serde_json::Value) -> String {
         serde_json::Value::String(s) => s,
         other => other.to_string(),
     }
+}
+
+/// Take the `concurrency` option out of a call's options, if present.
+///
+/// It is Nutmeg's option rather than Grust's: it says how many threads this
+/// execution may add, and Grust's validator would reject a key it does not
+/// declare. Absent, the kernels run the code they ran before threads existed,
+/// which is what an embedder that never asked for them should get.
+///
+/// # Errors
+/// Reports a value that is not a positive integer.
+pub fn take_concurrency(
+    options: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<usize>> {
+    let Some(value) = options.remove("concurrency") else {
+        return Ok(None);
+    };
+    let workers = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        .filter(|workers| *workers > 0)
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "nutmeg: concurrency must be a positive integer, got {value}"
+            ))
+        })?;
+    Ok(Some(workers as usize))
 }
 
 /// Turn a call's JSON options into Grust's validated arguments. Positional
@@ -669,6 +704,7 @@ pub fn run(
     algorithm: &str,
     graph_name: &str,
     args: &ValidatedArguments,
+    concurrency: Option<usize>,
 ) -> Result<Vec<RecordBatch>> {
     if algorithm == "estimateCsr" {
         // Sizing before building: counts only, as in Grust's procedure.
@@ -689,7 +725,7 @@ pub fn run(
             ],
         );
     }
-    let graph = Registry::projection(graph_name, args)?;
+    let graph = Registry::projection(graph_name, args, concurrency)?;
     let g = &graph;
     let cursor = match algorithm {
         "projectionStats" => {
@@ -730,6 +766,7 @@ fn probe_args(algorithm: &str, orientation: Option<&str>) -> Result<ValidatedArg
 }
 
 const PROBE: &str = "nutmeg.schema-probe";
+const PROBE_UNDIRECTED: &str = "nutmeg.schema-probe.undirected";
 
 static SCHEMAS: Lazy<RwLock<HashMap<String, SchemaRef>>> = Lazy::new(Default::default);
 
@@ -740,32 +777,29 @@ pub fn output_schema(algorithm: &str) -> Result<SchemaRef> {
         return Ok(found.clone());
     }
     let mut schemas = SCHEMAS.write().map_err(|_| poisoned())?;
-    if Registry::entry(PROBE, false)?.is_none() {
-        let edges = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("source", DataType::Utf8, false),
-                Field::new("target", DataType::Utf8, false),
-            ])),
-            vec![
-                Arc::new(StringArray::from(vec!["a", "b", "a"])),
-                Arc::new(StringArray::from(vec!["b", "c", "c"])),
-            ],
-        )?;
-        Registry::stage(
-            PROBE,
-            Part::Edges,
-            &[edges],
-            &ColumnMapping::default(),
-            true,
-        )?;
+    for name in [PROBE, PROBE_UNDIRECTED] {
+        if Registry::entry(name, false)?.is_none() {
+            let edges = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("source", DataType::Utf8, false),
+                    Field::new("target", DataType::Utf8, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec!["a", "b", "a"])),
+                    Arc::new(StringArray::from(vec!["b", "c", "c"])),
+                ],
+            )?;
+            Registry::stage(name, Part::Edges, &[edges], &ColumnMapping::default(), true)?;
+        }
     }
     // A kernel defined on undirected graphs refuses the default directed
     // projection, and says so; probe it on an undirected one instead.
-    let batches = match run(algorithm, PROBE, &probe_args(algorithm, None)?) {
+    let batches = match run(algorithm, PROBE, &probe_args(algorithm, None)?, None) {
         Err(error) if error.to_string().contains("undirected") => run(
             algorithm,
             PROBE,
             &probe_args(algorithm, Some("undirected"))?,
+            None,
         )?,
         other => other?,
     };
@@ -782,6 +816,7 @@ pub struct AlgorithmTable {
     algorithm: &'static str,
     graph: String,
     args: Arc<ValidatedArguments>,
+    concurrency: Option<usize>,
     schema: SchemaRef,
 }
 
@@ -791,6 +826,9 @@ impl AlgorithmTable {
         graph: String,
         options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Self> {
+        let mut options = options.clone();
+        let concurrency = take_concurrency(&mut options)?;
+        let options = &options;
         let Some(algorithm) = resolve_algorithm(algorithm) else {
             return plan_err!(
                 "nutmeg: unknown algorithm `{algorithm}`; Grust registers {:?}",
@@ -801,12 +839,13 @@ impl AlgorithmTable {
             algorithm,
             graph,
             args: Arc::new(validate(algorithm, options)?),
+            concurrency,
             schema: output_schema(algorithm)?,
         })
     }
 
     pub fn batches(&self) -> Result<Vec<RecordBatch>> {
-        let batches = run(self.algorithm, &self.graph, &self.args)?;
+        let batches = run(self.algorithm, &self.graph, &self.args, self.concurrency)?;
         if let Some(bad) = batches
             .iter()
             .find(|b| b.schema().fields() != self.schema.fields())

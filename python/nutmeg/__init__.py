@@ -3,7 +3,7 @@
     from nutmeg import Nutmeg
     nm = Nutmeg(spark)                       # a Spark Connect session on a Nutmeg server
     g = nm.graph.project("g", edges=edges_df, source="src", target="dst")
-    nm.pagerank.stream(g, damping=0.9).orderBy("score", ascending=False).show()
+    nm.pagerank.stream(g, damping=0.9, concurrency=8).orderBy("score", ascending=False).show()
     nm.dijkstra.stream(g, source="a", weightProperty="w")
     nm.graph.project_grust("social")         # from grust-sail's grust_nodes / grust_edges
     g.drop()
@@ -64,7 +64,12 @@ class _Algorithm:
         self._name = name
 
     def stream(self, graph: "Graph | str", **configuration: Any):
-        """Run the algorithm and return its rows as a DataFrame."""
+        """Run the algorithm and return its rows as a DataFrame.
+
+        Keywords are the algorithm's own options, validated by Grust, plus
+        `concurrency`, which is how many threads the kernel may use in the
+        server. Without it the kernel runs on one thread.
+        """
         return self._nutmeg.run(self._name, graph, **configuration)
 
     __call__ = stream

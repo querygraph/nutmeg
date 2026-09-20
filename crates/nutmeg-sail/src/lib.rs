@@ -6,6 +6,11 @@
 //! (`orientation`, `weightProperty`, `damping`, `source`, ...), validated by
 //! Grust. Without `algorithm` the read lists the staged graphs.
 //!
+//! One option is Nutmeg's rather than Grust's: `concurrency` says how many
+//! threads the kernel may use. Left out, the kernel runs on the calling thread,
+//! which is what a server with its own scheduler should get unless it asks
+//! otherwise.
+//!
 //! Write: `df.write.format("nutmeg").option("graph", "g").option("part",
 //! "edges")` stages the DataFrame's rows as the graph's edges (`part=nodes`
 //! for its nodes). grust-sail's `grust_nodes`/`grust_edges` tables and the
@@ -92,6 +97,9 @@ impl DataSource for NutmegDataSource {
                 nutmeg_graph::algorithm_names()
             );
         };
+        // `concurrency` travels with the algorithm's options: it is Nutmeg's
+        // option, not Grust's, and AlgorithmTable takes it out before Grust
+        // validates the rest.
         let configuration = nutmeg_graph::options_from_strings(name, options)?;
         let table = AlgorithmTable::new(name, graph, &configuration)?;
         Ok(provider_as_source(Arc::new(table)))

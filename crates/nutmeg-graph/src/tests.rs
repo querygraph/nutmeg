@@ -133,9 +133,9 @@ fn projections_are_cached_per_option_set_and_dropped_on_restage() {
     let mut undirected = no_options();
     undirected.insert("orientation".into(), serde_json::json!("undirected"));
     let undirected = validate("wcc", &undirected).unwrap();
-    Registry::projection(name, &directed).unwrap();
-    Registry::projection(name, &directed).unwrap();
-    Registry::projection(name, &undirected).unwrap();
+    Registry::projection(name, &directed, None).unwrap();
+    Registry::projection(name, &directed, None).unwrap();
+    Registry::projection(name, &undirected, None).unwrap();
     let info = |n: &str| {
         Registry::list()
             .unwrap()
@@ -175,7 +175,7 @@ fn explicit_nodes_make_unknown_endpoints_an_error() {
         true,
     )
     .unwrap();
-    let error = Registry::projection(name, &validate("degree", &no_options()).unwrap())
+    let error = Registry::projection(name, &validate("degree", &no_options()).unwrap(), None)
         .err()
         .expect("unknown endpoint")
         .to_string();
@@ -188,9 +188,11 @@ fn explicit_nodes_make_unknown_endpoints_an_error() {
         true,
     )
     .unwrap();
-    Registry::projection(name, &validate("degree", &no_options()).unwrap()).unwrap();
+    Registry::projection(name, &validate("degree", &no_options()).unwrap(), None).unwrap();
 }
 
+// Needs DataFusion's SQL parser: `cargo test -p nutmeg-graph --features sql`.
+#[cfg(feature = "sql")]
 #[tokio::test]
 async fn every_algorithm_runs_through_sql() -> Result<()> {
     Registry::stage(
@@ -297,4 +299,79 @@ async fn every_algorithm_runs_through_sql() -> Result<()> {
         .await;
     assert!(format!("{:?}", error.err()).contains("no graph named"));
     Ok(())
+}
+
+#[test]
+fn concurrency_is_a_named_option_and_reaches_the_projection() {
+    let mut options = no_options();
+    options.insert("concurrency".into(), serde_json::json!(8));
+    let mut taken = options.clone();
+    assert_eq!(take_concurrency(&mut taken).unwrap(), Some(8));
+    assert!(
+        taken.is_empty(),
+        "the option is consumed, not passed to Grust"
+    );
+
+    // Grust's validator would reject it, which is why it is taken out first.
+    assert!(validate("degree", &options).is_err());
+
+    // A table built with it runs the kernels on a projection that asked for
+    // threads; one built without it runs the code that predates them.
+    let name = "concurrency-test";
+    let mapping = ColumnMapping::default();
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[edges(&["a", "b", "c"], &["b", "c", "a"], None)],
+        &mapping,
+        true,
+    )
+    .unwrap();
+    let args = validate("degree", &no_options()).unwrap();
+    assert_eq!(
+        Registry::projection(name, &args, Some(8))
+            .unwrap()
+            .execution()
+            .concurrency(),
+        8
+    );
+    assert_eq!(
+        Registry::projection(name, &args, None)
+            .unwrap()
+            .execution()
+            .concurrency_requested(),
+        None
+    );
+    // The two are different projections, so a later call cannot inherit a worker
+    // count from an earlier one.
+    let info = Registry::list()
+        .unwrap()
+        .into_iter()
+        .find(|graph| graph.name == name)
+        .unwrap();
+    assert_eq!(info.projections, 2);
+
+    let table = AlgorithmTable::new("degree", name.into(), &options).unwrap();
+    assert_eq!(table.batches().unwrap().len(), 1);
+    assert!(Registry::drop(name).unwrap());
+}
+
+#[test]
+fn the_catalog_is_served_whole_and_is_larger_than_the_twelve() {
+    // Nutmeg dispatches through Grust's own runner rather than a match arm per
+    // kernel, so the count below is not a list anyone maintains here. It exists
+    // to make the coverage visible: when Grust registers more, this number moves
+    // and nothing else has to.
+    let names = algorithm_names();
+    assert!(
+        names.len() >= 30,
+        "Grust registers {} kernels: {names:?}",
+        names.len()
+    );
+    for name in &names {
+        let schema = output_schema(name).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert!(!schema.fields().is_empty(), "{name} produced no columns");
+    }
+    // And the SQL surface is one function per kernel plus the listing.
+    assert_eq!(table_functions().len(), names.len() + 1);
 }
