@@ -1,0 +1,725 @@
+{
+  "part1.check.collapsed": {
+    "l1_diff": 0.26338668482409544,
+    "max_abs_diff": 0.004210411635722295,
+    "max_rel_diff": 3.0644036351275408,
+    "nodes": 774,
+    "top10_same_order": false,
+    "top10_same_set": false,
+    "top50_same_order": false,
+    "top50_same_set": false
+  },
+  "part1.check.default": {
+    "l1_diff": 3.673926870554852e-08,
+    "max_abs_diff": 4.841370054202779e-09,
+    "max_rel_diff": 3.507349550309249e-06,
+    "nodes": 774,
+    "top10_same_order": true,
+    "top10_same_set": true,
+    "top50_same_order": true,
+    "top50_same_set": true
+  },
+  "part1.check.networkx_vs_numpy": {
+    "l1_diff": 2.8655073106009787e-13,
+    "max_abs_diff": 5.514816034390968e-14,
+    "max_rel_diff": 3.995388679153145e-11,
+    "nodes": 774,
+    "top10_same_order": true,
+    "top10_same_set": true,
+    "top50_same_order": true,
+    "top50_same_set": true
+  },
+  "part1.check.tight": {
+    "l1_diff": 4.4265773772173e-13,
+    "max_abs_diff": 8.344605388621584e-14,
+    "max_rel_diff": 6.045152303357613e-11,
+    "nodes": 774,
+    "top10_same_order": true,
+    "top10_same_set": true,
+    "top50_same_order": true,
+    "top50_same_set": true
+  },
+  "part1.csv_columns": [
+    "start_time",
+    "stop_time",
+    "start_station_id",
+    "start_station_name",
+    "end_station_id",
+    "end_station_name",
+    "user_type",
+    "bike_id",
+    "gender",
+    "age",
+    "trip_duration"
+  ],
+  "part1.dangling": [
+    {
+      "station_id": 3198,
+      "station_name": "Heights Elevator",
+      "trips_in": 1
+    },
+    {
+      "station_id": 3203,
+      "station_name": "Hamilton Park",
+      "trips_in": 1
+    },
+    {
+      "station_id": 3213,
+      "station_name": "Van Vorst Park",
+      "trips_in": 1
+    },
+    {
+      "station_id": 3214,
+      "station_name": "Essex Light Rail",
+      "trips_in": 1
+    },
+    {
+      "station_id": 3245,
+      "station_name": "NYCBS DEPOT - DELANCEY",
+      "trips_in": 101
+    },
+    {
+      "station_id": 3267,
+      "station_name": "Morris Canal",
+      "trips_in": 2
+    },
+    {
+      "station_id": 3276,
+      "station_name": "Marin Light Rail",
+      "trips_in": 3
+    },
+    {
+      "station_id": 3426,
+      "station_name": "JCBS Depot",
+      "trips_in": 1
+    }
+  ],
+  "part1.delta_columns": [
+    "start_time",
+    "stop_time",
+    "start_station_id",
+    "start_station_name",
+    "end_station_id",
+    "end_station_name",
+    "user_type",
+    "bike_id",
+    "trip_duration"
+  ],
+  "part1.infer_schema": "cast Timestamp(Second, None) to Spark data type",
+  "part1.pagerank_run": {
+    "converged": 1,
+    "iterations": 55,
+    "nodes": 774,
+    "residual": 9.699506100808563e-09,
+    "score_sum": 0.9999999999999881
+  },
+  "part1.pagerank_tight_run": {
+    "converged": true,
+    "iterations": 114,
+    "residual": 9.397661143197011e-14
+  },
+  "part1.projection_stats": [
+    {
+      "arcs": 1595334,
+      "csrBytes": 25531544,
+      "edges": 1595334,
+      "nodes": 774,
+      "selfLoops": 26234
+    }
+  ],
+  "part1.reference": {
+    "final_l1_change": 8.784477052020678e-15,
+    "iterations": 127
+  },
+  "part1.rows": 1595334,
+  "part1.top10": [
+    {
+      "nodeId": 519,
+      "pagerank": 0.006700608017212705,
+      "station_name": "Pershing Square North",
+      "trips_in": 15524
+    },
+    {
+      "nodeId": 435,
+      "pagerank": 0.004887936487139483,
+      "station_name": "W 21 St & 6 Ave",
+      "trips_in": 11459
+    },
+    {
+      "nodeId": 402,
+      "pagerank": 0.004872273449596034,
+      "station_name": "Broadway & E 22 St",
+      "trips_in": 11060
+    },
+    {
+      "nodeId": 492,
+      "pagerank": 0.0047886542221537536,
+      "station_name": "W 33 St & 7 Ave",
+      "trips_in": 10762
+    },
+    {
+      "nodeId": 426,
+      "pagerank": 0.004711451346355557,
+      "station_name": "West St & Chambers St",
+      "trips_in": 10695
+    },
+    {
+      "nodeId": 497,
+      "pagerank": 0.0043270701557698325,
+      "station_name": "E 17 St & Broadway",
+      "trips_in": 9905
+    },
+    {
+      "nodeId": 477,
+      "pagerank": 0.00410698647020213,
+      "station_name": "W 41 St & 8 Ave",
+      "trips_in": 9426
+    },
+    {
+      "nodeId": 285,
+      "pagerank": 0.003910522938553279,
+      "station_name": "Broadway & E 14 St",
+      "trips_in": 8896
+    },
+    {
+      "nodeId": 462,
+      "pagerank": 0.0039075924055528765,
+      "station_name": "W 22 St & 10 Ave",
+      "trips_in": 9176
+    },
+    {
+      "nodeId": 379,
+      "pagerank": 0.0037079908595506568,
+      "station_name": "W 31 St & 7 Ave",
+      "trips_in": 8640
+    }
+  ],
+  "part2.astar": {
+    "from": "W 106 St & Central Park West",
+    "hops": 2,
+    "path": [
+      "W 106 St & Central Park West",
+      "Pershing Square North",
+      "Atlantic Ave & Fort Greene Pl"
+    ],
+    "settled": 78,
+    "to": "Atlantic Ave & Fort Greene Pl",
+    "total_metres": 12914.98041285332
+  },
+  "part2.betweenness_top10": [
+    {
+      "betweenness": 28906.25,
+      "communityId": "532",
+      "station_name": "Queens Plaza North & Crescent St"
+    },
+    {
+      "betweenness": 18167.333333333336,
+      "communityId": "245",
+      "station_name": "Schermerhorn St & Bond St"
+    },
+    {
+      "betweenness": 15928.16666666667,
+      "communityId": "72",
+      "station_name": "W 43 St & 6 Ave"
+    },
+    {
+      "betweenness": 15518.083333333334,
+      "communityId": "532",
+      "station_name": "45 Rd & 11 St"
+    },
+    {
+      "betweenness": 14820.833333333332,
+      "communityId": "72",
+      "station_name": "Broadway & W 41 St"
+    },
+    {
+      "betweenness": 14538.666666666666,
+      "communityId": "245",
+      "station_name": "Lawrence St & Willoughby St"
+    },
+    {
+      "betweenness": 12531.666666666666,
+      "communityId": "245",
+      "station_name": "Hanson Pl & Ashland Pl"
+    },
+    {
+      "betweenness": 12400.0,
+      "communityId": "79",
+      "station_name": "Broadway & E 22 St"
+    },
+    {
+      "betweenness": 12243.499999999998,
+      "communityId": "532",
+      "station_name": "N 6 St & Bedford Ave"
+    },
+    {
+      "betweenness": 12187.333333333332,
+      "communityId": "281",
+      "station_name": "1 Ave & E 62 St"
+    }
+  ],
+  "part2.check.astar": {
+    "astar": 12914.98041285332,
+    "networkx_dijkstra": 12914.98041285332,
+    "nutmeg_dijkstra": 12914.98041285332,
+    "same_path": true
+  },
+  "part2.check.betweenness": {
+    "max_abs_diff": 5.4569682106375694e-12,
+    "max_score": 28906.25,
+    "nodes": 761
+  },
+  "part2.check.geography": {
+    "mean_metres_to_own_centroid": 1866.7122913913029,
+    "permutations": 1000,
+    "share_nearest_centroid_is_own": 0.8460543337645536,
+    "shuffled_mean": 4471.471731378249,
+    "shuffled_min": 4421.577297403228,
+    "shuffles_at_or_below_observed": 0,
+    "stations": 773
+  },
+  "part2.check.modularity": {
+    "abs_diff": 0.0,
+    "networkx": 0.44113566145549504,
+    "nutmeg": 0.44113566145549504
+  },
+  "part2.check.weighted": {
+    "l1_diff": 3.899440641254846e-08,
+    "max_abs_diff": 7.640176052795336e-09,
+    "max_rel_diff": 5.665475225712054e-06,
+    "nodes": 772,
+    "top10_same_order": true,
+    "top10_same_set": true,
+    "top50_same_order": true,
+    "top50_same_set": true
+  },
+  "part2.citibike_header": [
+    "tripduration",
+    "starttime",
+    "stoptime",
+    "start station id",
+    "start station name",
+    "start station latitude",
+    "start station longitude",
+    "end station id",
+    "end station name",
+    "end station latitude",
+    "end station longitude",
+    "bikeid",
+    "usertype",
+    "birth year",
+    "gender"
+  ],
+  "part2.communities": [
+    {
+      "centroid_lat": 40.6828,
+      "centroid_lon": -73.9768,
+      "communityId": "245",
+      "highest_pagerank_station": "Hanson Pl & Ashland Pl",
+      "max_lat": 40.716,
+      "max_lon": -73.93,
+      "min_lat": 40.655,
+      "min_lon": -74.016,
+      "stations": 207
+    },
+    {
+      "centroid_lat": 40.787,
+      "centroid_lon": -73.96,
+      "communityId": "281",
+      "highest_pagerank_station": "Broadway & W 60 St",
+      "max_lat": 40.814,
+      "max_lon": -73.931,
+      "min_lat": 40.71,
+      "min_lon": -74.069,
+      "stations": 167
+    },
+    {
+      "centroid_lat": 40.7239,
+      "centroid_lon": -73.9975,
+      "communityId": "79",
+      "highest_pagerank_station": "W 21 St & 6 Ave",
+      "max_lat": 40.761,
+      "max_lon": -73.974,
+      "min_lat": 40.701,
+      "min_lon": -74.048,
+      "stations": 162
+    },
+    {
+      "centroid_lat": 40.7406,
+      "centroid_lon": -73.9414,
+      "communityId": "532",
+      "highest_pagerank_station": "Metropolitan Ave & Bedford Ave",
+      "max_lat": 40.781,
+      "max_lon": -73.908,
+      "min_lat": 40.7,
+      "min_lon": -73.968,
+      "stations": 142
+    },
+    {
+      "centroid_lat": 40.7529,
+      "centroid_lon": -73.986,
+      "communityId": "72",
+      "highest_pagerank_station": "Pershing Square North",
+      "max_lat": 40.768,
+      "max_lon": -73.966,
+      "min_lat": 40.728,
+      "min_lon": -74.044,
+      "stations": 91
+    },
+    {
+      "centroid_lat": 40.6881,
+      "centroid_lon": -74.0191,
+      "communityId": "3182",
+      "highest_pagerank_station": "Soissons Landing",
+      "max_lat": 40.692,
+      "max_lon": -74.015,
+      "min_lat": 40.685,
+      "min_lon": -74.025,
+      "stations": 3
+    },
+    {
+      "centroid_lat": 40.6465,
+      "centroid_lon": -74.0166,
+      "communityId": "3239",
+      "highest_pagerank_station": "Bressler",
+      "max_lat": 40.647,
+      "max_lon": -74.017,
+      "min_lat": 40.647,
+      "min_lon": -74.017,
+      "stations": 1
+    }
+  ],
+  "part2.coordinate_columns": [
+    "start station latitude",
+    "start station longitude",
+    "end station latitude",
+    "end station longitude"
+  ],
+  "part2.coordinate_coverage": {
+    "in_nyc_box": 773,
+    "stations": 774,
+    "with_coordinates": 774,
+    "with_moving_coordinates": 0
+  },
+  "part2.corr_mean_minutes_vs_rise": 0.5363851572768149,
+  "part2.dijkstra_read": "nutmeg: `dijkstra` produced [Field { name: \"nodeId\", data_type: Utf8 }, Field { name: \"distance\", data_type: Float64, nullable: true }], declared [Field { name: \"nodeId\", data_type: Utf8 }, Field { name: \"distance\", data_type: Float64 }]",
+  "part2.excluded_long_trips": {
+    "longest_minutes": 111781.68,
+    "trips_over_180_min": 2025
+  },
+  "part2.leiden": {
+    "communities": 8,
+    "converged": 1,
+    "levels": 3,
+    "modularity": 0.44113566145549504
+  },
+  "part2.links": {
+    "links": 70830,
+    "max_seconds": 7416,
+    "min_seconds": 68,
+    "sources": 760
+  },
+  "part2.outside_box": [
+    {
+      "latitude": 45.50626419100119,
+      "longitude": -73.56890559196472,
+      "station_id": 3650,
+      "station_name": "8D Mobile 01"
+    }
+  ],
+  "part2.readback": [
+    {
+      "betweenness": 28906.25,
+      "community": "532",
+      "minutes_rank": 72,
+      "pagerank_rank": 54,
+      "station_name": "Queens Plaza North & Crescent St"
+    },
+    {
+      "betweenness": 18167.333333333336,
+      "community": "245",
+      "minutes_rank": 303,
+      "pagerank_rank": 223,
+      "station_name": "Schermerhorn St & Bond St"
+    },
+    {
+      "betweenness": 15928.16666666667,
+      "community": "72",
+      "minutes_rank": 121,
+      "pagerank_rank": 138,
+      "station_name": "W 43 St & 6 Ave"
+    },
+    {
+      "betweenness": 15518.083333333334,
+      "community": "532",
+      "minutes_rank": 405,
+      "pagerank_rank": 364,
+      "station_name": "45 Rd & 11 St"
+    },
+    {
+      "betweenness": 14820.833333333332,
+      "community": "72",
+      "minutes_rank": 18,
+      "pagerank_rank": 19,
+      "station_name": "Broadway & W 41 St"
+    }
+  ],
+  "part2.stage_join_direct": "Invalid HashJoinExec, unsupported PartitionMode Auto in execute()",
+  "part2.station_metrics_rows": 774,
+  "part2.weighted_fallers": [
+    {
+      "mean_minutes_in": 9.683683360258483,
+      "pagerank_minutes": 0.0010941218755679625,
+      "pagerank_trips": 0.001976145006378735,
+      "rank_by_minutes": 356,
+      "rank_by_trips": 134,
+      "rise": -222,
+      "station_name": "31 St & Broadway",
+      "trips_in": 1238
+    },
+    {
+      "mean_minutes_in": 8.18817411402157,
+      "pagerank_minutes": 0.0008405868557449716,
+      "pagerank_trips": 0.0014497072986509407,
+      "rank_by_minutes": 466,
+      "rank_by_trips": 257,
+      "rise": -209,
+      "station_name": "Macon St & Nostrand Ave",
+      "trips_in": 1298
+    },
+    {
+      "mean_minutes_in": 8.45925690695459,
+      "pagerank_minutes": 0.0016225847634551548,
+      "pagerank_trips": 0.0026612408874644314,
+      "rank_by_minutes": 218,
+      "rank_by_trips": 51,
+      "rise": -167,
+      "station_name": "N 8 St & Driggs Ave",
+      "trips_in": 3149
+    },
+    {
+      "mean_minutes_in": 8.422801650051566,
+      "pagerank_minutes": 0.0015725657740686568,
+      "pagerank_trips": 0.002446721240695328,
+      "rank_by_minutes": 229,
+      "rank_by_trips": 66,
+      "rise": -163,
+      "station_name": "DeKalb Ave & Hudson Ave",
+      "trips_in": 2909
+    },
+    {
+      "mean_minutes_in": 10.946242774566475,
+      "pagerank_minutes": 0.0012053894448727398,
+      "pagerank_trips": 0.0018732715828716584,
+      "rank_by_minutes": 314,
+      "rank_by_trips": 160,
+      "rise": -154,
+      "station_name": "31 St & 23 Ave",
+      "trips_in": 1038
+    }
+  ],
+  "part2.weighted_risers": [
+    {
+      "mean_minutes_in": 25.112106084243365,
+      "pagerank_minutes": 0.0012799069521418967,
+      "pagerank_trips": 0.000792359296664106,
+      "rank_by_minutes": 290,
+      "rank_by_trips": 534,
+      "rise": 244,
+      "station_name": "Riverside Dr & W 104 St",
+      "trips_in": 1282
+    },
+    {
+      "mean_minutes_in": 22.979288256227758,
+      "pagerank_minutes": 0.001298874228462483,
+      "pagerank_trips": 0.000819704998605182,
+      "rank_by_minutes": 289,
+      "rank_by_trips": 522,
+      "rise": 233,
+      "station_name": "Riverside Dr & W 78 St",
+      "trips_in": 1405
+    },
+    {
+      "mean_minutes_in": 24.682148997134664,
+      "pagerank_minutes": 0.0010617613152485417,
+      "pagerank_trips": 0.0006659688896128964,
+      "rank_by_minutes": 372,
+      "rank_by_trips": 596,
+      "rise": 224,
+      "station_name": "Riverside Dr & W 91 St",
+      "trips_in": 1047
+    },
+    {
+      "mean_minutes_in": 25.26907258064517,
+      "pagerank_minutes": 0.001268915308262074,
+      "pagerank_trips": 0.0008610529780238861,
+      "rank_by_minutes": 291,
+      "rank_by_trips": 498,
+      "rise": 207,
+      "station_name": "Broadway & Moylan Pl",
+      "trips_in": 1240
+    },
+    {
+      "mean_minutes_in": 20.319456521739134,
+      "pagerank_minutes": 0.0011350223892270283,
+      "pagerank_trips": 0.0008218388026900084,
+      "rank_by_minutes": 334,
+      "rank_by_trips": 520,
+      "rise": 186,
+      "station_name": "West End Ave & W 94 St",
+      "trips_in": 1380
+    },
+    {
+      "mean_minutes_in": 20.13752398081535,
+      "pagerank_minutes": 0.0013144816925822248,
+      "pagerank_trips": 0.0009252995111538003,
+      "rank_by_minutes": 283,
+      "rank_by_trips": 459,
+      "rise": 176,
+      "station_name": "Riverside Dr & W 82 St",
+      "trips_in": 1668
+    },
+    {
+      "mean_minutes_in": 19.54594089526293,
+      "pagerank_minutes": 0.0017312685256830591,
+      "pagerank_trips": 0.0011773069827396177,
+      "rank_by_minutes": 195,
+      "rank_by_trips": 352,
+      "rise": 157,
+      "station_name": "Bus Slip & State St",
+      "trips_in": 2301
+    },
+    {
+      "mean_minutes_in": 20.974567445674456,
+      "pagerank_minutes": 0.0018960426107186247,
+      "pagerank_trips": 0.0012559725167061227,
+      "rank_by_minutes": 164,
+      "rank_by_trips": 316,
+      "rise": 152,
+      "station_name": "Riverside Dr & W 72 St",
+      "trips_in": 2439
+    },
+    {
+      "mean_minutes_in": 17.725796486977593,
+      "pagerank_minutes": 0.001248161452897452,
+      "pagerank_trips": 0.0009532296486212333,
+      "rank_by_minutes": 300,
+      "rank_by_trips": 447,
+      "rise": 147,
+      "station_name": "Cherry St",
+      "trips_in": 1651
+    },
+    {
+      "mean_minutes_in": 17.786474226804124,
+      "pagerank_minutes": 0.0010613551485088237,
+      "pagerank_trips": 0.0008366334004911706,
+      "rank_by_minutes": 373,
+      "rank_by_trips": 513,
+      "rise": 140,
+      "station_name": "W 88 St & West End Ave",
+      "trips_in": 1455
+    }
+  ],
+  "part2.weighted_top10": [
+    {
+      "mean_minutes_in": 12.833404008506799,
+      "pagerank_minutes": 0.0071446572807659725,
+      "pagerank_trips": 0.0067103522177072725,
+      "rank_by_minutes": 1,
+      "rank_by_trips": 1,
+      "station_name": "Pershing Square North",
+      "trips_in": 15517
+    },
+    {
+      "mean_minutes_in": 17.994255239520953,
+      "pagerank_minutes": 0.006703935515772005,
+      "pagerank_trips": 0.004715257478403746,
+      "rank_by_minutes": 2,
+      "rank_by_trips": 5,
+      "station_name": "West St & Chambers St",
+      "trips_in": 10688
+    },
+    {
+      "mean_minutes_in": 12.14767727930536,
+      "pagerank_minutes": 0.005092752363774367,
+      "pagerank_trips": 0.004878337744521643,
+      "rank_by_minutes": 3,
+      "rank_by_trips": 3,
+      "station_name": "Broadway & E 22 St",
+      "trips_in": 11056
+    },
+    {
+      "mean_minutes_in": 19.947474058280022,
+      "pagerank_minutes": 0.004933659710937826,
+      "pagerank_trips": 0.0032200610777705654,
+      "rank_by_minutes": 4,
+      "rank_by_trips": 21,
+      "station_name": "12 Ave & W 40 St",
+      "trips_in": 7035
+    },
+    {
+      "mean_minutes_in": 12.116566248256623,
+      "pagerank_minutes": 0.004896958779776214,
+      "pagerank_trips": 0.004876626122261506,
+      "rank_by_minutes": 5,
+      "rank_by_trips": 4,
+      "station_name": "W 33 St & 7 Ave",
+      "trips_in": 10755
+    },
+    {
+      "mean_minutes_in": 11.4772555012225,
+      "pagerank_minutes": 0.004803901583394153,
+      "pagerank_trips": 0.004893723736035883,
+      "rank_by_minutes": 6,
+      "rank_by_trips": 2,
+      "station_name": "W 21 St & 6 Ave",
+      "trips_in": 11452
+    },
+    {
+      "mean_minutes_in": 14.074387343153305,
+      "pagerank_minutes": 0.004525014288737429,
+      "pagerank_trips": 0.0039093715761410915,
+      "rank_by_minutes": 7,
+      "rank_by_trips": 9,
+      "station_name": "W 22 St & 10 Ave",
+      "trips_in": 9165
+    },
+    {
+      "mean_minutes_in": 12.678742572156201,
+      "pagerank_minutes": 0.004325506937753842,
+      "pagerank_trips": 0.004112378461695134,
+      "rank_by_minutes": 8,
+      "rank_by_trips": 7,
+      "station_name": "W 41 St & 8 Ave",
+      "trips_in": 9424
+    },
+    {
+      "mean_minutes_in": 11.306260228305884,
+      "pagerank_minutes": 0.00423581283586706,
+      "pagerank_trips": 0.004331937010604076,
+      "rank_by_minutes": 9,
+      "rank_by_trips": 6,
+      "station_name": "E 17 St & Broadway",
+      "trips_in": 9899
+    },
+    {
+      "mean_minutes_in": 17.064244457409572,
+      "pagerank_minutes": 0.004212669789509716,
+      "pagerank_trips": 0.0031821741645119118,
+      "rank_by_minutes": 10,
+      "rank_by_trips": 23,
+      "station_name": "South End Ave & Liberty St",
+      "trips_in": 6856
+    }
+  ],
+  "versions": {
+    "grust commit": "4d8e5dbd37e6d729cd11136a92d81dac18434496",
+    "host": "Linux 6.12.107+deb13-cloud-amd64 x86_64",
+    "nutmeg commit": "7566ff0caeb9f05e579a4f148a3be5e6532f8c0e",
+    "pyspark (client)": "4.2.0",
+    "python (client)": "3.13.5",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "sail commit": "f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f",
+    "server Spark version (spark.version)": "4.2.0"
+  }
+}
