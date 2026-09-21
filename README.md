@@ -46,6 +46,18 @@ Nutmeg adds a way in and a way out, not a second graph library.
 - `python/nutmeg` — a PySpark client shaped like the `graphdatascience`
   verbs: `project`, `page_rank.stream`, `wcc.stream`, …
 
+## Column names
+
+Results carry the column names Grust's registry declares, the ones
+`CALL grust.algorithms.<name>(...) YIELD ...` uses. A few differ from Neo4j
+GDS's for the same quantity (Yen's `pathIndex`, GDS `index`; `iterations`
+and `converged`, GDS `ranIterations` and `didConverge`; ...). Opting in per
+read with `columnNames` = `gds` (the `nutmeg` read option, a key in a table
+function's JSON configuration, or `Nutmeg(spark, column_names="gds")` for a
+whole client) renames those columns, from the cited table
+`nutmeg_graph::GDS_COLUMN_ALIASES`. Only names change: where GDS's row shape
+differs from Grust's, it still does.
+
 ## Sail
 
 Nutmeg builds against a Sail checkout at `../sail` (commit recorded in

@@ -398,3 +398,248 @@ fn staged_node_columns_reach_the_kernels_that_read_them() {
     assert_eq!(total, 3.0);
     assert!(Registry::drop(name).unwrap());
 }
+
+/// The alias table is data about Grust's registry, so it is checked against
+/// the registry: every Grust name it renames is one some kernel declares, no
+/// rename gives two columns of one kernel the same name, and no kernel claims
+/// the option that chooses the names.
+#[test]
+fn gds_aliases_name_declared_columns_and_never_collide() {
+    let declared: HashSet<&str> = definitions()
+        .into_iter()
+        .flat_map(|d| d.outputs.iter().map(|f| f.name.as_str()))
+        .collect();
+    for (grust, gds) in GDS_COLUMN_ALIASES {
+        assert!(declared.contains(grust), "alias for undeclared `{grust}`");
+        assert_ne!(grust, gds);
+    }
+    for definition in definitions() {
+        let name = short(definition);
+        let schema = Arc::new(Schema::new(
+            definition
+                .outputs
+                .iter()
+                .map(|f| Field::new(f.name.as_str(), DataType::Null, true))
+                .collect::<Vec<_>>(),
+        ));
+        ColumnNames::Gds
+            .rename_schema(&schema)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        for field in definition
+            .options
+            .iter()
+            .map(|o| &o.field)
+            .chain(definition.arguments.iter().map(|a| &a.field))
+        {
+            assert!(
+                !field.name.eq_ignore_ascii_case(COLUMN_NAMES_OPTION),
+                "{name} declares `{}`, which Nutmeg takes for itself",
+                field.name
+            );
+        }
+    }
+}
+
+/// For every kernel and both namings, the schema a table reports is the one
+/// its scan returns: `batches` re-checks every batch against it, and fails if
+/// a rename were applied to one and not the other.
+#[test]
+fn every_algorithm_reports_the_columns_its_scan_returns_under_either_naming() {
+    for definition in definitions() {
+        let name = short(definition);
+        output_schema(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let (args, _) = probe(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let args = Arc::new(args);
+        for names in [ColumnNames::Grust, ColumnNames::Gds] {
+            let table = AlgorithmTable {
+                algorithm: name,
+                graph: PROBE.to_string(),
+                args: args.clone(),
+                names,
+                schema: output_schema_named(name, names).unwrap(),
+            };
+            let batches = table
+                .batches()
+                .unwrap_or_else(|e| panic!("{name} {names:?}: {e}"));
+            assert!(!batches.is_empty(), "{name} {names:?}");
+            let got: Vec<String> = batches[0]
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            let expected: Vec<&str> = definition
+                .outputs
+                .iter()
+                .map(|f| names.rename(&f.name))
+                .collect();
+            assert_eq!(got, expected, "{name} {names:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn gds_names_are_chosen_per_read_and_grust_names_stay_reachable() -> Result<()> {
+    Registry::stage(
+        "gds-names",
+        Part::Edges,
+        &[edges(&["a", "b", "a"], &["b", "c", "c"], None)],
+        &ColumnMapping::default(),
+        true,
+    )?;
+    let ctx = SessionContext::new();
+    register(&ctx);
+    let columns = |sql: &str| {
+        let ctx = ctx.clone();
+        let sql = sql.to_string();
+        async move {
+            let frame = ctx.sql(&sql).await?;
+            let names: Vec<String> = frame
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            let rows: usize = frame.collect().await?.iter().map(|b| b.num_rows()).sum();
+            Ok::<_, DataFusionError>((names, rows))
+        }
+    };
+    let (grust, rows) = columns(
+        "SELECT * FROM nutmeg_yens('gds-names', '{\"source\": \"a\", \"target\": \"c\", \"k\": 2}')",
+    )
+    .await?;
+    assert!(grust.contains(&"pathIndex".to_string()), "{grust:?}");
+    assert_eq!(rows, 2);
+    let (gds, rows) = columns(
+        "SELECT * FROM nutmeg_yens('gds-names', \
+         '{\"source\": \"a\", \"target\": \"c\", \"k\": 2, \"columnNames\": \"gds\"}')",
+    )
+    .await?;
+    assert!(gds.contains(&"index".to_string()), "{gds:?}");
+    assert!(!gds.contains(&"pathIndex".to_string()), "{gds:?}");
+    assert_eq!(rows, 2);
+    let (gds, _) = columns(
+        "SELECT \"nodeId\", \"ranIterations\", \"didConverge\" \
+         FROM nutmeg_pagerank('gds-names', '{\"columnNames\": \"GDS\"}')",
+    )
+    .await?;
+    assert_eq!(gds, ["nodeId", "ranIterations", "didConverge"]);
+    let error = match ctx
+        .sql("SELECT * FROM nutmeg_pagerank('gds-names', '{\"columnNames\": \"neo4j\"}')")
+        .await
+    {
+        Ok(_) => panic!("an unknown naming was accepted"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("columnNames"), "{error}");
+    assert!(Registry::drop("gds-names").unwrap());
+    Ok(())
+}
+
+/// `linkPrediction` reads a node property for `sameCommunity` alone, so the
+/// same kernel runs through both of Nutmeg's paths; `allPairsShortestPaths`
+/// streams through its own cursor. Values, on a path a - b - c - d whose
+/// communities are {a, b, c} and {d}: the distance-two pairs are (a, c) and
+/// (b, d), sharing one neighbour each, in one community and in two.
+#[test]
+fn link_prediction_and_all_pairs_serve_their_values() {
+    let name = "link-prediction";
+    let nodes = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("community", DataType::Int32, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            Arc::new(Int32Array::from(vec![0, 0, 0, 1])),
+        ],
+    )
+    .unwrap();
+    let mapping = ColumnMapping::default();
+    Registry::stage(name, Part::Nodes, &[nodes], &mapping, true).unwrap();
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[edges(&["a", "b", "c"], &["b", "c", "d"], None)],
+        &mapping,
+        true,
+    )
+    .unwrap();
+    let scores = |metric: &str| {
+        let options: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "orientation": "undirected", "metric": metric,
+                "communityProperty": "community",
+            }))
+            .unwrap();
+        let args = validate("linkPrediction", &options).unwrap();
+        let batches = run("linkPrediction", name, &args).unwrap();
+        let mut out = Vec::new();
+        for batch in &batches {
+            let column = |c: &str| cast(batch.column_by_name(c).unwrap(), &DataType::Utf8).unwrap();
+            let (first, second) = (column("node1"), column("node2"));
+            let first = first.as_any().downcast_ref::<StringArray>().unwrap();
+            let second = second.as_any().downcast_ref::<StringArray>().unwrap();
+            let score = batch
+                .column_by_name("score")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                out.push((
+                    first.value(row).to_string(),
+                    second.value(row).to_string(),
+                    score.value(row),
+                ));
+            }
+        }
+        out
+    };
+    let pair = |a: &str, b: &str, s: f64| (a.to_string(), b.to_string(), s);
+    assert_eq!(
+        scores("sameCommunity"),
+        [pair("a", "c", 1.0), pair("b", "d", 0.0)]
+    );
+    assert_eq!(
+        scores("commonNeighbors"),
+        [pair("a", "c", 1.0), pair("b", "d", 1.0)]
+    );
+
+    let distances = |options: serde_json::Value| {
+        let options: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(options).unwrap();
+        let args = validate("allPairsShortestPaths", &options).unwrap();
+        let mut out = BTreeMap::new();
+        for batch in run("allPairsShortestPaths", name, &args).unwrap() {
+            let column = |c: &str| cast(batch.column_by_name(c).unwrap(), &DataType::Utf8).unwrap();
+            let (source, target) = (column("sourceNodeId"), column("targetNodeId"));
+            let source = source.as_any().downcast_ref::<StringArray>().unwrap();
+            let target = target.as_any().downcast_ref::<StringArray>().unwrap();
+            let distance = batch
+                .column_by_name("distance")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                out.insert(
+                    (source.value(row).to_string(), target.value(row).to_string()),
+                    distance.value(row),
+                );
+            }
+        }
+        out
+    };
+    let all = distances(serde_json::json!({}));
+    let key = |a: &str, b: &str| (a.to_string(), b.to_string());
+    assert_eq!(all.get(&key("a", "b")), Some(&1.0), "{all:?}");
+    assert_eq!(all.get(&key("a", "c")), Some(&2.0), "{all:?}");
+    assert_eq!(all.get(&key("a", "d")), Some(&3.0), "{all:?}");
+    assert_eq!(all.get(&key("b", "d")), Some(&2.0), "{all:?}");
+    let from_b = distances(serde_json::json!({ "sourceNodes": ["b"] }));
+    assert!(!from_b.is_empty());
+    assert!(from_b.keys().all(|(source, _)| source == "b"), "{from_b:?}");
+    assert_eq!(from_b.get(&key("b", "d")), Some(&2.0), "{from_b:?}");
+    assert!(Registry::drop(name).unwrap());
+}

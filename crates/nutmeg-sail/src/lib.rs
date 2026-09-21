@@ -4,7 +4,10 @@
 //! "pagerank")` runs one Grust algorithm on a staged graph and returns its
 //! rows. Every other option is Grust's configuration for that algorithm
 //! (`orientation`, `weightProperty`, `damping`, `source`, ...), validated by
-//! Grust. Without `algorithm` the read lists the staged graphs.
+//! Grust. Without `algorithm` the read lists the staged graphs. The one
+//! option that is Nutmeg's, `columnNames` (`grust`, the default, or `gds`),
+//! chooses whether result columns keep Grust's names or take GDS's where they
+//! differ (`nutmeg_graph::GDS_COLUMN_ALIASES`).
 //!
 //! Write: `df.write.format("nutmeg").option("graph", "g").option("part",
 //! "edges")` stages the DataFrame's rows as the graph's edges (`part=nodes`
@@ -92,8 +95,15 @@ impl DataSource for NutmegDataSource {
                 nutmeg_graph::algorithm_names()
             );
         };
+        let names = match take(
+            &mut options,
+            &nutmeg_graph::COLUMN_NAMES_OPTION.to_ascii_lowercase(),
+        ) {
+            Some(text) => nutmeg_graph::ColumnNames::parse(&text)?,
+            None => nutmeg_graph::ColumnNames::Grust,
+        };
         let configuration = nutmeg_graph::options_from_strings(name, options)?;
-        let table = AlgorithmTable::new(name, graph, &configuration)?;
+        let table = AlgorithmTable::named(name, graph, &configuration, names)?;
         Ok(provider_as_source(Arc::new(table)))
     }
 

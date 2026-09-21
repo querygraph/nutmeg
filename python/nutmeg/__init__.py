@@ -12,7 +12,9 @@ The verbs follow Neo4j's `graphdatascience` client so existing code reads
 the same. The algorithms and their options are Grust's: every keyword is
 passed to the server and validated there by Grust's procedure registry, so
 this client knows no algorithm names and needs no change when Grust adds one.
-Results are ordinary lazy DataFrames; `mutate` and `write` are DataFrame
+Result columns carry Grust's names unless the client is made with
+`Nutmeg(spark, column_names="gds")`, which renames the ones GDS names
+differently. Results are ordinary lazy DataFrames; `mutate` and `write` are DataFrame
 operations (join, `write.saveAsTable`), not separate modes.
 """
 from __future__ import annotations
@@ -138,14 +140,24 @@ class _GraphCatalog:
 class Nutmeg:
     """Entry point, over a Spark Connect session on a Nutmeg-enabled Sail server."""
 
-    def __init__(self, spark):
+    def __init__(self, spark, column_names: str = "grust"):
+        """`column_names="gds"` reports result columns under GDS's names where
+        Grust's differ (`index` for Yen's `pathIndex`, `ranIterations` and
+        `didConverge` for `iterations` and `converged`, ...) for every read
+        from this client. The default keeps Grust's names, the ones its
+        registry declares; one call can override with `columnNames=`."""
+        if column_names not in ("grust", "gds"):
+            raise ValueError(f"column_names is 'grust' or 'gds', got {column_names!r}")
         self.spark = spark
+        self.column_names = column_names
         self.graph = _GraphCatalog(self)
 
     def run(self, algorithm: str, graph: "Graph | str", **configuration: Any):
         name = graph.name if isinstance(graph, Graph) else graph
         reader = (self.spark.read.format(FORMAT)
                   .option("graph", name).option("algorithm", algorithm))
+        if self.column_names != "grust":
+            reader = reader.option("columnNames", self.column_names)
         for key, value in configuration.items():
             if value is not None:
                 reader = reader.option(key, _text(value))

@@ -74,24 +74,148 @@ pub fn definitions() -> Vec<&'static ProcedureDefinition> {
     all
 }
 
-// Grust's registry keeps names case-folded. These are the spellings Grust
-// registers them under, used for display and to derive SQL names; a name
-// not listed here is shown as the registry has it.
-const SPELLINGS: [&str; 5] = [
-    "estimateCsr",
-    "multiSourceBfs",
-    "projectionStats",
-    "shortestPaths",
-    "topologicalSort",
-];
+// Grust's registry keeps names case-folded. The spellings Grust registers
+// them under, used for display and to derive SQL names, are its projection
+// kernels' own names plus the two inspection procedures Nutmeg serves by hand
+// in `run`; a name found in neither is shown as the registry has it.
+const INSPECTIONS: [&str; 2] = ["estimateCsr", "projectionStats"];
 
 fn spelled(registered: &'static str) -> &'static str {
-    SPELLINGS
-        .iter()
-        .copied()
+    grust_algorithm_procedures::projection_kernel_names()
+        .into_iter()
+        .chain(INSPECTIONS)
         .find(|s| s.eq_ignore_ascii_case(registered))
         .unwrap_or(registered)
 }
+
+/// The names a result's columns are reported under.
+///
+/// `Grust` (the default) is the registry's declared outputs, the names
+/// `CALL grust.algorithms.<name>(...) YIELD ...` uses. `Gds` renames the
+/// columns listed in [`GDS_COLUMN_ALIASES`] to the names Neo4j Graph Data
+/// Science gives the same quantity, for code moving over from GDS; every
+/// other column keeps its Grust name. The choice is per read, so no Grust
+/// name is ever unreachable: a read without it gets Grust's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColumnNames {
+    #[default]
+    Grust,
+    Gds,
+}
+
+/// The read option, SQL configuration key and client keyword that choose
+/// [`ColumnNames`]. It is Nutmeg's, not an algorithm option: it is taken
+/// out before Grust validates the rest, and a test fails if any registered
+/// kernel ever declares an option or argument of the same name.
+pub const COLUMN_NAMES_OPTION: &str = "columnNames";
+
+impl ColumnNames {
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "grust" => Ok(Self::Grust),
+            "gds" => Ok(Self::Gds),
+            other => {
+                plan_err!("nutmeg: `{COLUMN_NAMES_OPTION}` is `grust` or `gds`, got `{other}`")
+            }
+        }
+    }
+
+    /// Remove the choice from a JSON configuration, leaving Grust's options.
+    pub fn take(options: &mut serde_json::Map<String, serde_json::Value>) -> Result<Self> {
+        let Some(key) = options
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(COLUMN_NAMES_OPTION))
+            .cloned()
+        else {
+            return Ok(Self::Grust);
+        };
+        match options.remove(&key) {
+            Some(serde_json::Value::String(text)) => Self::parse(&text),
+            other => plan_err!("nutmeg: `{COLUMN_NAMES_OPTION}` must be a string, got {other:?}"),
+        }
+    }
+
+    fn rename(self, name: &str) -> &str {
+        match self {
+            Self::Grust => name,
+            Self::Gds => GDS_COLUMN_ALIASES
+                .iter()
+                .find(|(grust, _)| *grust == name)
+                .map_or(name, |(_, gds)| gds),
+        }
+    }
+
+    /// `schema` with each field renamed. Every column is looked up by its
+    /// Grust name, so a rename is simultaneous: `triangles` → `triangleCount`
+    /// and `triangleCount` → `globalTriangleCount` in one result is a
+    /// relabelling, not a chain. A rename that would give two columns one
+    /// name is refused rather than shadowing one of them.
+    pub fn rename_schema(self, schema: &SchemaRef) -> Result<SchemaRef> {
+        if self == Self::Grust {
+            return Ok(schema.clone());
+        }
+        let fields: Vec<Field> = schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone().with_name(self.rename(f.name())))
+            .collect();
+        let mut seen = HashSet::new();
+        if let Some(twice) = fields.iter().find(|f| !seen.insert(f.name().as_str())) {
+            return exec_err!(
+                "nutmeg: `{COLUMN_NAMES_OPTION}: gds` would name two columns `{}`",
+                twice.name()
+            );
+        }
+        Ok(Arc::new(Schema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        )))
+    }
+
+    fn rename_batch(self, batch: RecordBatch) -> Result<RecordBatch> {
+        if self == Self::Grust {
+            return Ok(batch);
+        }
+        let schema = self.rename_schema(&batch.schema())?;
+        Ok(RecordBatch::try_new(schema, batch.columns().to_vec())?)
+    }
+}
+
+/// Grust's column name → the name Neo4j Graph Data Science uses for the same
+/// quantity. Data, keyed by column and not by algorithm: an entry applies
+/// wherever Grust yields that column, so it is listed only where the column
+/// means the same thing in every kernel that yields it, and GDS's name is
+/// cited from GDS's documentation (the procedure pages under
+/// <https://neo4j.com/docs/graph-data-science/current/algorithms/>):
+///
+/// - `pathIndex` → `index`: `gds.shortestPath.yens.stream` yields `index`.
+///   Grust cannot use `index`, a reserved word in its Cypher dialect.
+/// - `iterations` → `ranIterations`, `converged` → `didConverge`: the stats
+///   mode of `gds.pageRank`, `gds.articleRank`, `gds.eigenvector`,
+///   `gds.hits`, `gds.labelPropagation`, `gds.k1coloring`, and
+///   (`didConverge`) `gds.leiden`.
+/// - `levels` → `ranLevels`: stats mode of `gds.louvain` and `gds.leiden`.
+/// - `triangles` → `triangleCount`, `triangleCount` → `globalTriangleCount`:
+///   `gds.triangleCount` streams a node's triangles as `triangleCount` and
+///   reports the graph's total as `globalTriangleCount`; Grust's per-node
+///   `triangles` and total `triangleCount` are those two.
+/// - `coefficient` → `localClusteringCoefficient`, `averageCoefficient` →
+///   `averageClusteringCoefficient`: `gds.localClusteringCoefficient` stream
+///   and stats modes.
+///
+/// GDS reports the iteration and level counts in its stats mode, and Grust
+/// repeats them on every row; the rename gives them GDS's names, not GDS's
+/// row shape.
+pub const GDS_COLUMN_ALIASES: &[(&str, &str)] = &[
+    ("pathIndex", "index"),
+    ("iterations", "ranIterations"),
+    ("converged", "didConverge"),
+    ("levels", "ranLevels"),
+    ("triangles", "triangleCount"),
+    ("triangleCount", "globalTriangleCount"),
+    ("coefficient", "localClusteringCoefficient"),
+    ("averageCoefficient", "averageClusteringCoefficient"),
+];
 
 fn short(definition: &'static ProcedureDefinition) -> &'static str {
     spelled(&definition.name[PREFIX.len()..])
@@ -898,8 +1022,31 @@ const PROBE: &str = "nutmeg.schema-probe";
 
 static SCHEMAS: Lazy<RwLock<HashMap<String, SchemaRef>>> = Lazy::new(Default::default);
 
+/// Run `algorithm` once on the probe graph, which must be staged, returning
+/// the arguments it ran with and its batches. A kernel defined on undirected
+/// graphs refuses the default directed projection, and says so; it is probed
+/// on an undirected one instead.
+fn probe(algorithm: &str) -> Result<(ValidatedArguments, Vec<RecordBatch>)> {
+    let args = probe_args(algorithm, None)?;
+    match run(algorithm, PROBE, &args) {
+        Err(error) if error.to_string().contains("undirected") => {
+            let args = probe_args(algorithm, Some("undirected"))?;
+            let batches = run(algorithm, PROBE, &args)?;
+            Ok((args, batches))
+        }
+        other => Ok((args, other?)),
+    }
+}
+
 /// The Arrow schema an algorithm's result has: the kernel's own, observed by
-/// running it once on a three-node graph, not a transcription of it.
+/// running it once on a three-node graph, not a transcription of it. These
+/// are Grust's names; [`output_schema_named`] reports them as a read with a
+/// [`ColumnNames`] choice returns them.
+pub fn output_schema_named(algorithm: &str, names: ColumnNames) -> Result<SchemaRef> {
+    names.rename_schema(&output_schema(algorithm)?)
+}
+
+/// See [`output_schema_named`]; Grust's names.
 pub fn output_schema(algorithm: &str) -> Result<SchemaRef> {
     if let Some(found) = SCHEMAS.read().map_err(|_| poisoned())?.get(algorithm) {
         return Ok(found.clone());
@@ -931,16 +1078,7 @@ pub fn output_schema(algorithm: &str) -> Result<SchemaRef> {
             true,
         )?;
     }
-    // A kernel defined on undirected graphs refuses the default directed
-    // projection, and says so; probe it on an undirected one instead.
-    let batches = match run(algorithm, PROBE, &probe_args(algorithm, None)?) {
-        Err(error) if error.to_string().contains("undirected") => run(
-            algorithm,
-            PROBE,
-            &probe_args(algorithm, Some("undirected"))?,
-        )?,
-        other => other?,
-    };
+    let (_, batches) = probe(algorithm)?;
     let Some(first) = batches.first() else {
         return exec_err!("nutmeg: probing `{algorithm}` produced no batch");
     };
@@ -954,14 +1092,28 @@ pub struct AlgorithmTable {
     algorithm: &'static str,
     graph: String,
     args: Arc<ValidatedArguments>,
+    names: ColumnNames,
     schema: SchemaRef,
 }
 
 impl AlgorithmTable {
+    /// A table over `graph` with Grust's column names.
     pub fn new(
         algorithm: &str,
         graph: String,
         options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self> {
+        Self::named(algorithm, graph, options, ColumnNames::Grust)
+    }
+
+    /// A table over `graph` whose columns are reported under `names`. The
+    /// schema reported and the batches a scan returns are renamed by the same
+    /// function, and `batches` re-checks one against the other.
+    pub fn named(
+        algorithm: &str,
+        graph: String,
+        options: &serde_json::Map<String, serde_json::Value>,
+        names: ColumnNames,
     ) -> Result<Self> {
         let Some(algorithm) = resolve_algorithm(algorithm) else {
             return plan_err!(
@@ -973,12 +1125,16 @@ impl AlgorithmTable {
             algorithm,
             graph,
             args: Arc::new(validate(algorithm, options)?),
-            schema: output_schema(algorithm)?,
+            names,
+            schema: output_schema_named(algorithm, names)?,
         })
     }
 
     pub fn batches(&self) -> Result<Vec<RecordBatch>> {
-        let batches = run(self.algorithm, &self.graph, &self.args)?;
+        let batches = run(self.algorithm, &self.graph, &self.args)?
+            .into_iter()
+            .map(|batch| self.names.rename_batch(batch))
+            .collect::<Result<Vec<_>>>()?;
         if let Some(bad) = batches
             .iter()
             .find(|b| b.schema().fields() != self.schema.fields())
@@ -1097,13 +1253,14 @@ pub fn parse_options(json: &str) -> Result<serde_json::Map<String, serde_json::V
     }
 }
 
-/// `nutmeg_<algorithm>('graph'[, '{json configuration}'])`.
+/// `nutmeg_<algorithm>('graph'[, '{json configuration}'])`. The configuration
+/// is Grust's, plus Nutmeg's `columnNames` (`"grust"` or `"gds"`).
 #[derive(Debug)]
 struct AlgorithmFunction(&'static str);
 
 impl TableFunctionImpl for AlgorithmFunction {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
-        let (graph, options) = match args {
+        let (graph, mut options) = match args {
             [g] => (literal_string(g, 1)?, Default::default()),
             [g, o] => (
                 literal_string(g, 1)?,
@@ -1116,7 +1273,10 @@ impl TableFunctionImpl for AlgorithmFunction {
                 );
             }
         };
-        Ok(Arc::new(AlgorithmTable::new(self.0, graph, &options)?))
+        let names = ColumnNames::take(&mut options)?;
+        Ok(Arc::new(AlgorithmTable::named(
+            self.0, graph, &options, names,
+        )?))
     }
 }
 
