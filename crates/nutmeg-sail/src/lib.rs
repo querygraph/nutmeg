@@ -26,12 +26,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::provider_as_source;
-use datafusion::execution::SessionStateBuilder;
-use datafusion::physical_plan::{ExecutionPlan, collect};
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::execution::{SessionStateBuilder, TaskContext};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+};
 use datafusion::prelude::SessionConfig;
 use datafusion_common::{Result, not_impl_err, plan_err};
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableSource, TableType};
+use futures::TryStreamExt;
 use nutmeg_graph::{AlgorithmTable, ColumnMapping, GraphsTable, Part, Registry};
 use sail_common_datafusion::datasource::{
     DataSource, DataSourceRegistry, OptionLayer, SinkInfo, SinkMode, SourceInfo,
@@ -164,7 +168,8 @@ impl DataSource for NutmegDataSource {
     }
 }
 
-/// The write target: collects the input's rows and stages them.
+/// The write target. Planning it yields a [`StageWriter`] that stages the
+/// input's rows when the plan runs.
 #[derive(Debug)]
 struct StageSink {
     graph: String,
@@ -194,32 +199,67 @@ impl TableProvider for StageSink {
         plan_err!("nutmeg: the write target is not readable; read with an `algorithm` option")
     }
 
+    /// Called by DataFusion's physical planner while it builds the plan, before
+    /// its physical optimizer has run over the whole tree. `input` is therefore
+    /// not yet runnable: a join in it still has `PartitionMode::Auto`, which
+    /// only the `JoinSelection` rule resolves. So nothing is executed here; the
+    /// returned `DataSinkExec` stages the rows when the optimized plan runs.
     async fn insert_into(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         _insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Sail plans this on the server; the rows are consumed here, in the
-        // process that owns the projection registry.
-        let batches = collect(input, state.task_ctx()).await?;
+        let sink = StageWriter {
+            graph: self.graph.clone(),
+            part: self.part,
+            mapping: self.mapping.clone(),
+            replace: self.replace,
+            schema: self.schema.clone(),
+        };
+        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
+    }
+}
+
+/// The execution half of [`StageSink`]: receives the input's rows when the
+/// plan runs, in the process that owns the projection registry, and stages
+/// them. `DataSinkExec` asks for a single input partition and reports the
+/// returned row count as its `count` column, as DataFusion's own sinks do.
+#[derive(Debug)]
+struct StageWriter {
+    graph: String,
+    part: Part,
+    mapping: ColumnMapping,
+    replace: bool,
+    schema: arrow::datatypes::SchemaRef,
+}
+
+impl DisplayAs for StageWriter {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "NutmegStage: graph={}, part={:?}", self.graph, self.part)
+    }
+}
+
+#[async_trait]
+impl DataSink for StageWriter {
+    fn schema(&self) -> &arrow::datatypes::SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        data: SendableRecordBatchStream,
+        _context: &Arc<TaskContext>,
+    ) -> Result<u64> {
+        let batches: Vec<_> = data.try_collect().await?;
         let rows = Registry::stage(
             &self.graph,
             self.part,
             &batches,
             &self.mapping,
             self.replace,
-        )? as u64;
-        // Report the staged row count the way DataFusion's sinks do.
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("count", arrow::datatypes::DataType::UInt64, false),
-        ]));
-        let batch = arrow::record_batch::RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(arrow::array::UInt64Array::from(vec![rows]))],
         )?;
-        let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])?;
-        table.scan(state, None, &[], None).await
+        Ok(rows as u64)
     }
 }
 
@@ -270,5 +310,113 @@ impl ServerSessionMutator for NutmegSessionMutator {
         info: &ServerSessionInfo,
     ) -> Result<datafusion::execution::runtime_env::RuntimeEnvBuilder> {
         self.inner.mutate_runtime_env(builder, info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int32Array, StringArray, UInt64Array};
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use datafusion_expr::{JoinType, col};
+
+    fn table(name: &str, columns: [(&str, ArrayRef); 2]) -> Result<LogicalPlan> {
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|(n, a)| Field::new(*n, a.data_type().clone(), false))
+                .collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), columns.map(|(_, a)| a).to_vec())?;
+        let provider = MemTable::try_new(schema, vec![vec![batch]])?;
+        LogicalPlanBuilder::scan(name, provider_as_source(Arc::new(provider)), None)?.build()
+    }
+
+    type ArrayRef = Arc<dyn Array>;
+
+    /// A graph built the ordinary way: trips joined to stations, then staged.
+    /// With more than one target partition DataFusion plans the join as a
+    /// `HashJoinExec` in `PartitionMode::Auto`, which the `JoinSelection`
+    /// physical optimizer rule resolves. The sink used to execute its input
+    /// inside `insert_into`, during planning and before that rule ran, and
+    /// failed with "Invalid HashJoinExec, unsupported PartitionMode Auto in
+    /// execute()" — the Citi Bike example's failure, without Sail.
+    #[tokio::test]
+    async fn a_joined_dataframe_is_staged() -> Result<()> {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+        let trips = table(
+            "trips",
+            [
+                ("start", Arc::new(Int32Array::from(vec![1, 2, 2]))),
+                ("end", Arc::new(Int32Array::from(vec![2, 3, 1]))),
+            ],
+        )?;
+        let starts = table(
+            "starts",
+            [
+                ("id", Arc::new(Int32Array::from(vec![1, 2, 3]))),
+                ("source", Arc::new(StringArray::from(vec!["a", "b", "c"]))),
+            ],
+        )?;
+        let ends = table(
+            "ends",
+            [
+                ("id", Arc::new(Int32Array::from(vec![1, 2, 3]))),
+                ("target", Arc::new(StringArray::from(vec!["a", "b", "c"]))),
+            ],
+        )?;
+        let input = LogicalPlanBuilder::from(trips)
+            .join(
+                starts,
+                JoinType::Inner,
+                (vec!["trips.start"], vec!["starts.id"]),
+                None,
+            )?
+            .join(
+                ends,
+                JoinType::Inner,
+                (vec!["trips.end"], vec!["ends.id"]),
+                None,
+            )?
+            .project(vec![col("source"), col("target")])?
+            .build()?;
+        let info = SinkInfo {
+            input,
+            mode: SinkMode::Overwrite,
+            partition_by: vec![],
+            bucket_by: None,
+            sort_order: vec![],
+            options: vec![OptionLayer::OptionList {
+                items: vec![
+                    ("graph".into(), "joined".into()),
+                    ("part".into(), "edges".into()),
+                ],
+            }],
+            lakehouse_table: None,
+        };
+        let plan = NutmegDataSource.create_writer(&ctx.state(), info).await?;
+        let physical = ctx.state().create_physical_plan(&plan).await?;
+        let shown = datafusion::physical_plan::displayable(physical.as_ref())
+            .indent(false)
+            .to_string();
+        assert!(shown.contains("HashJoinExec"), "{shown}");
+        let batches = datafusion::physical_plan::collect(physical, ctx.task_ctx()).await?;
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, 3);
+        let staged = Registry::list()?
+            .into_iter()
+            .find(|g| g.name == "joined")
+            .expect("staged");
+        assert_eq!(staged.staged_edges, 3);
+        assert!(Registry::drop("joined")?);
+        Ok(())
     }
 }

@@ -767,26 +767,10 @@ def main() -> int:
             WHERE {box('c')}
               AND c.station_id IN (SELECT source FROM route_edges UNION SELECT target FROM route_edges)"""
         report.code(route_edges_sql.strip())
-        # Staging a DataFrame whose plan contains a join fails in this Nutmeg
-        # build (the sink collects its input before Sail has finished planning
-        # it). Try it, report the outcome, and otherwise stage from Delta.
-        try:
-            (spark.sql(route_edges_sql).write.format("nutmeg").option("graph", "routes_probe")
-                .option("part", "edges").option("sourceColumn", "source").option("targetColumn", "target")
-                .mode("overwrite").save())
-            report.emit("- Staging the joined DataFrame directly: ok.")
-            report.record("part2.stage_join_direct", "ok")
-        except Exception as error:  # noqa: BLE001 - reported verbatim
-            message = str(error).splitlines()[0]
-            report.emit(f"- Staging the joined DataFrame directly failed in this Nutmeg build: `{message}`. "
-                        "The route tables are written to Delta first and staged from there.")
-            report.record("part2.stage_join_direct", message)
-        spark.sql(route_edges_sql).write.format("delta").mode("overwrite").save(delta("route_edges"))
-        spark.read.format("delta").load(delta("route_edges")).createOrReplaceTempView("route_edges")
-        spark.sql(route_nodes_sql).write.format("delta").mode("overwrite").save(delta("route_nodes"))
-        spark.read.format("delta").load(delta("route_nodes")).createOrReplaceTempView("route_nodes")
+        # Both tables are joins over the tables above, staged as they are.
+        spark.sql(route_edges_sql).createOrReplaceTempView("route_edges")
         route_edges = spark.table("route_edges")
-        (spark.table("route_nodes").write.format("nutmeg").option("graph", "routes").option("part", "nodes")
+        (spark.sql(route_nodes_sql).write.format("nutmeg").option("graph", "routes").option("part", "nodes")
             .option("idColumn", "station_id").mode("overwrite").save())
         (route_edges.write.format("nutmeg").option("graph", "routes").option("part", "edges")
             .option("sourceColumn", "source").option("targetColumn", "target").mode("overwrite").save())
@@ -828,19 +812,10 @@ def main() -> int:
                                        coords_pd.latitude[int(dst)], coords_pd.longitude[int(dst)]))
             report.emit(f"- Total {total:.1f} m over {len(path) - 1} links; straight line {straight:.1f} m; "
                         f"the search settled {settled} stations.")
-            try:
-                dij = run(spark, "routes", "dijkstra", source=src, weightProperty="metres").toPandas()
-                dij_total = float(dij.set_index("nodeId").distance[dst])
-                dij_label = "Nutmeg `dijkstra`"
-                report.record("part2.dijkstra_read", "ok")
-            except Exception as error:  # noqa: BLE001 - reported verbatim
-                message = str(error).splitlines()[0]
-                report.emit(f"- Nutmeg `dijkstra` failed in this build: `{message}`. "
-                            "Its single-source sibling `shortestPaths` is used for the cross-check instead.")
-                report.record("part2.dijkstra_read", message)
-                sp_rows = run(spark, "routes", "shortestPaths", source=src, weightProperty="metres").toPandas()
-                dij_total = float(sp_rows.set_index("targetNodeId").totalCost[dst])
-                dij_label = "Nutmeg `shortestPaths`"
+            dij = run(spark, "routes", "dijkstra", source=src, weightProperty="metres").toPandas()
+            dij_total = float(dij.set_index("nodeId").distance[dst])
+            unreachable = int(dij.distance.isna().sum())
+            report.record("part2.dijkstra_unreachable", unreachable)
             edges_pd = route_edges.toPandas()
             rg = nx.DiGraph()
             rg.add_weighted_edges_from(edges_pd[["source", "target", "metres"]].astype(
@@ -851,7 +826,8 @@ def main() -> int:
                 f"SELECT nodeId FROM nutmeg_astar('routes', '{{\"source\": \"{src}\", \"target\": \"{dst}\", "
                 f"\"weightProperty\": \"metres\"}}') ORDER BY costFromSource").toPandas().nodeId.tolist()
             same_path = [str(x) for x in nx_path] == [str(x) for x in ours_path_ids]
-            report.emit(f"- {dij_label} (Dijkstra) to the same target: {dij_total:.6f} m; NetworkX Dijkstra on the "
+            report.emit(f"- Nutmeg `dijkstra` to the same target: {dij_total:.6f} m ({unreachable} stations "
+                        f"unreachable from the start, read as NULL); NetworkX Dijkstra on the "
                         f"same edges: {nx_total:.6f} m; A*: {total:.6f} m (largest pairwise |diff| "
                         f"{max(abs(total - dij_total), abs(total - nx_total), abs(dij_total - nx_total)):.3e} m). "
                         f"NetworkX's path is the same station sequence: {same_path}.")

@@ -31,6 +31,9 @@ fn every_algorithm_grust_registers_is_served_with_its_declared_columns() {
         let produced: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         let declared: Vec<&str> = definition.outputs.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(produced, declared, "{name}");
+        let produced: Vec<bool> = schema.fields().iter().map(|f| f.is_nullable()).collect();
+        let declared: Vec<bool> = definition.outputs.iter().map(|f| f.nullable).collect();
+        assert_eq!(produced, declared, "{name}: nullability");
     }
 }
 
@@ -642,4 +645,187 @@ fn link_prediction_and_all_pairs_serve_their_values() {
     assert!(from_b.keys().all(|(source, _)| source == "b"), "{from_b:?}");
     assert_eq!(from_b.get(&key("b", "d")), Some(&2.0), "{from_b:?}");
     assert!(Registry::drop(name).unwrap());
+}
+
+/// Every kernel that declares a nullable output is read on a graph where that
+/// column holds a null, and the reported schema says nullable for it and for
+/// nothing Grust declares non-nullable.
+///
+/// The schema is observed on a three-node probe on which every node reaches
+/// every other, so most nullable columns are full there. Grust's Arrow cursors
+/// set a column's nullable flag from whether that batch holds a null, so the
+/// probe used to report `distance` as non-nullable and every read with an
+/// unreachable node failed its schema check (`dijkstra` in the Citi Bike
+/// example). The reverse failed too: `degree` probes unweighted, where
+/// `strength` is all null, so a weighted read, where it is full, was refused.
+///
+/// The graph: a weighted cycle a → b → c → a, and d, staged as a node with no
+/// edges. From a, d is unreachable; the cycle leaves `longestPath` without
+/// distances; d has no neighbours for a clustering coefficient; d alone in its
+/// community has no volume for a conductance; unweighted, `degree` has no
+/// strength.
+#[test]
+fn declared_nullable_outputs_are_nullable_whatever_the_rows_hold() {
+    let name = "nullable-outputs";
+    let nodes = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("community", DataType::Int32, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            Arc::new(Int32Array::from(vec![0, 0, 0, 1])),
+        ],
+    )
+    .unwrap();
+    let mapping = ColumnMapping::default();
+    Registry::stage(name, Part::Nodes, &[nodes], &mapping, true).unwrap();
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[edges(
+            &["a", "b", "c"],
+            &["b", "c", "a"],
+            Some(&[1.0, 2.0, 3.0]),
+        )],
+        &mapping,
+        true,
+    )
+    .unwrap();
+
+    // Kernel, options, the declared-nullable column that holds a null here.
+    let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+        ("degree", serde_json::json!({}), "strength"),
+        ("bfs", serde_json::json!({ "source": "a" }), "distance"),
+        (
+            "dijkstra",
+            serde_json::json!({ "source": "a", "weightProperty": "w" }),
+            "distance",
+        ),
+        (
+            "multiSourceBfs",
+            serde_json::json!({ "sources": ["a"] }),
+            "distance",
+        ),
+        ("longestPath", serde_json::json!({}), "distance"),
+        (
+            "localClusteringCoefficient",
+            serde_json::json!({ "orientation": "undirected" }),
+            "coefficient",
+        ),
+        (
+            "modularity",
+            serde_json::json!({ "orientation": "undirected", "communityProperty": "community" }),
+            "conductance",
+        ),
+        (
+            "bellmanFord",
+            serde_json::json!({ "source": "a", "weightProperty": "w" }),
+            "distance",
+        ),
+    ];
+
+    // The cases cover exactly the kernels that declare a nullable output, so a
+    // new nullable declaration fails here until it is read with a null.
+    let declared: BTreeMap<&str, Vec<&str>> = definitions()
+        .into_iter()
+        .map(|d| {
+            let nullable = d
+                .outputs
+                .iter()
+                .filter(|f| f.nullable)
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>();
+            (short(d), nullable)
+        })
+        .filter(|(_, nullable)| !nullable.is_empty())
+        .collect();
+    let covered: BTreeMap<&str, Vec<&str>> = cases
+        .iter()
+        .map(|(kernel, _, column)| (*kernel, vec![*column]))
+        .collect();
+    assert_eq!(covered, declared);
+
+    let read = |graph: &str, kernel: &str, options: &serde_json::Value| {
+        let options: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(options.clone()).unwrap();
+        let table = AlgorithmTable::new(kernel, graph.to_string(), &options)
+            .unwrap_or_else(|e| panic!("{kernel}: {e}"));
+        let batches = table.batches().unwrap_or_else(|e| panic!("{kernel}: {e}"));
+        (table.schema(), batches)
+    };
+    for (kernel, options, column) in &cases {
+        let (schema, batches) = read(name, kernel, options);
+        let definition = definition_of(kernel).unwrap();
+        for (field, declared) in schema.fields().iter().zip(&definition.outputs) {
+            assert_eq!(
+                field.is_nullable(),
+                declared.nullable,
+                "{kernel}.{}",
+                field.name()
+            );
+        }
+        let nulls: usize = batches
+            .iter()
+            .map(|b| b.column_by_name(column).unwrap().null_count())
+            .sum();
+        assert!(
+            nulls > 0,
+            "{kernel}: `{column}` holds no null on this graph"
+        );
+        for batch in &batches {
+            assert_eq!(batch.schema().fields(), schema.fields(), "{kernel}");
+        }
+    }
+
+    // The same columns full, on the cycle alone: the flag must not follow the
+    // rows the other way either.
+    let full = "nullable-outputs-full";
+    Registry::stage(
+        full,
+        Part::Edges,
+        &[edges(
+            &["a", "b", "c"],
+            &["b", "c", "a"],
+            Some(&[1.0, 2.0, 3.0]),
+        )],
+        &mapping,
+        true,
+    )
+    .unwrap();
+    for (kernel, options, column) in [
+        (
+            "degree",
+            serde_json::json!({ "weightProperty": "w" }),
+            "strength",
+        ),
+        (
+            "dijkstra",
+            serde_json::json!({ "source": "a", "weightProperty": "w" }),
+            "distance",
+        ),
+    ] {
+        let (schema, batches) = read(full, kernel, &options);
+        let nulls: usize = batches
+            .iter()
+            .map(|b| b.column_by_name(column).unwrap().null_count())
+            .sum();
+        assert_eq!(nulls, 0, "{kernel}: `{column}` should be full here");
+        assert!(
+            schema.field_with_name(column).unwrap().is_nullable(),
+            "{kernel}"
+        );
+        for batch in &batches {
+            assert!(
+                batch
+                    .schema()
+                    .field_with_name(column)
+                    .unwrap()
+                    .is_nullable(),
+                "{kernel}"
+            );
+        }
+    }
+    assert!(Registry::drop(name).unwrap());
+    assert!(Registry::drop(full).unwrap());
 }

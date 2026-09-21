@@ -857,8 +857,69 @@ fn output_names(algorithm: &str) -> Result<Vec<&'static str>> {
         .collect())
 }
 
-/// Run one Grust algorithm on the named graph.
+/// Run one Grust algorithm on the named graph. Every batch carries the
+/// nullability Grust declares for each output column, whatever the rows in it
+/// happen to hold (see [`conform`]).
 pub fn run(
+    algorithm: &str,
+    graph_name: &str,
+    args: &ValidatedArguments,
+) -> Result<Vec<RecordBatch>> {
+    let definition = definition_of(algorithm)?;
+    run_kernel(algorithm, graph_name, args)?
+        .into_iter()
+        .map(|batch| conform(definition, batch))
+        .collect()
+}
+
+/// Restate a result batch's schema with each column's declared nullability.
+///
+/// Grust's Arrow cursors build their batches with `RecordBatch::try_from_iter`,
+/// which marks a column nullable exactly when that batch's array holds a null.
+/// So the flag describes the rows, not the kernel: a declared-nullable column
+/// that happens to be full comes out non-nullable, and two batches of one
+/// result can disagree. The declaration is the contract; the data types are
+/// kept as produced. A declared non-nullable column that holds a null is
+/// refused here, by Arrow's own check, rather than passed on.
+fn conform(definition: &ProcedureDefinition, batch: RecordBatch) -> Result<RecordBatch> {
+    let observed = batch.schema();
+    if observed.fields().len() != definition.outputs.len() {
+        return exec_err!(
+            "nutmeg: `{}` produced {} columns, Grust declares {}",
+            definition.name,
+            observed.fields().len(),
+            definition.outputs.len()
+        );
+    }
+    let fields: Vec<Field> = observed
+        .fields()
+        .iter()
+        .zip(&definition.outputs)
+        .map(|(field, declared)| {
+            if *field.name() != declared.name {
+                return exec_err!(
+                    "nutmeg: `{}` produced column `{}` where Grust declares `{}`",
+                    definition.name,
+                    field.name(),
+                    declared.name
+                );
+            }
+            Ok(field.as_ref().clone().with_nullable(declared.nullable))
+        })
+        .collect::<Result<_>>()?;
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        observed.metadata().clone(),
+    ));
+    RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(|e| {
+        err(format!(
+            "`{}` broke its declared output schema: {e}",
+            definition.name
+        ))
+    })
+}
+
+fn run_kernel(
     algorithm: &str,
     graph_name: &str,
     args: &ValidatedArguments,
@@ -1038,8 +1099,10 @@ fn probe(algorithm: &str) -> Result<(ValidatedArguments, Vec<RecordBatch>)> {
     }
 }
 
-/// The Arrow schema an algorithm's result has: the kernel's own, observed by
-/// running it once on a three-node graph, not a transcription of it. These
+/// The Arrow schema an algorithm's result has: the kernel's own column names
+/// and types, observed by running it once on a three-node graph, not a
+/// transcription of them. Nullability is Grust's declaration, not what the
+/// probe's rows held: on three nodes most nullable columns are full. These
 /// are Grust's names; [`output_schema_named`] reports them as a read with a
 /// [`ColumnNames`] choice returns them.
 pub fn output_schema_named(algorithm: &str, names: ColumnNames) -> Result<SchemaRef> {

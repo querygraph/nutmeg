@@ -40,3 +40,43 @@ def test_project_and_run(nm):
     with pytest.raises(Exception, match="dampng"):
         nm.pagerank.stream(g, dampng=0.5).collect()
     g.drop()
+
+
+def test_stage_a_joined_dataframe(nm):
+    # The ordinary way to build a graph: trips joined to stations, then staged.
+    # The sink used to run its input while the plan was still being built,
+    # before the join's partition mode was chosen, and failed with
+    # "unsupported PartitionMode Auto".
+    spark = nm.spark
+    trips = spark.createDataFrame([(1, 2), (2, 3), (3, 1)], "start int, stop int")
+    stations = spark.createDataFrame([(1, "a"), (2, "b"), (3, "c")], "id int, name string")
+    edges = (trips.join(stations.withColumnRenamed("name", "src"), trips.start == stations.id)
+             .drop("id")
+             .join(stations.withColumnRenamed("name", "dst"), trips.stop == stations.id)
+             .select("src", "dst"))
+    g = nm.graph.project("joined", edges, source="src", target="dst")
+    assert g.stats().collect()[0]["edges"] == 3
+    g.drop()
+
+
+def test_nullable_outputs_hold_nulls(nm):
+    # d is staged with no edges, so it is unreachable from a: its distance is
+    # NULL. The reported schema used to be observed on a probe where every node
+    # is reachable, and declared `distance` non-nullable.
+    spark = nm.spark
+    edges = spark.createDataFrame([("a", "b", 1.0), ("b", "c", 2.0)], "src string, dst string, w double")
+    nodes = spark.createDataFrame([("a",), ("b",), ("c",), ("d",)], "id string")
+    g = nm.graph.project("unreachable", edges, nodes, source="src", target="dst", id="id")
+    for algorithm, options in [
+        ("dijkstra", {"source": "a", "weightProperty": "w"}),
+        ("bfs", {"source": "a"}),
+        ("bellmanFord", {"source": "a", "weightProperty": "w"}),
+    ]:
+        reader = spark.read.format("nutmeg").option("graph", "unreachable").option("algorithm", algorithm)
+        for key, value in options.items():
+            reader = reader.option(key, value)
+        frame = reader.load()
+        assert frame.schema["distance"].nullable, algorithm
+        dist = {r["nodeId"]: r["distance"] for r in frame.collect()}
+        assert dist["d"] is None and dist["a"] == 0.0, (algorithm, dist)
+    g.drop()

@@ -18,3 +18,6 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 sail-common-datafusion = { workspace = true }
 sail-session = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

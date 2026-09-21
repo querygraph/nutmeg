@@ -5592,6 +5592,7 @@ dependencies = [
  "nutmeg-graph",
  "sail-common-datafusion",
  "sail-session",
+ "tokio",
 ]
 
 [[package]]
