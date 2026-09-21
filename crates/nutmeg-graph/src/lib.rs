@@ -874,13 +874,15 @@ pub fn run(
 
 /// Restate a result batch's schema with each column's declared nullability.
 ///
-/// Grust's Arrow cursors build their batches with `RecordBatch::try_from_iter`,
-/// which marks a column nullable exactly when that batch's array holds a null.
-/// So the flag describes the rows, not the kernel: a declared-nullable column
-/// that happens to be full comes out non-nullable, and two batches of one
-/// result can disagree. The declaration is the contract; the data types are
-/// kept as produced. A declared non-nullable column that holds a null is
-/// refused here, by Arrow's own check, rather than passed on.
+/// Grust's `run_on_projection` and `run_with_properties` now give every batch
+/// the nullability each kernel's registration declares, so on a current Grust
+/// this changes nothing. It stays as the boundary check: Grust releases before
+/// that fix built batches with `RecordBatch::try_from_iter`, which marks a
+/// column nullable exactly when that batch holds a null, and a column name or
+/// count that differs from the declaration is refused here either way. The
+/// declaration is the contract; the data types are kept as produced. A
+/// declared non-nullable column that holds a null is refused, by Arrow's own
+/// check, rather than passed on.
 fn conform(definition: &ProcedureDefinition, batch: RecordBatch) -> Result<RecordBatch> {
     let observed = batch.schema();
     if observed.fields().len() != definition.outputs.len() {

@@ -37,6 +37,51 @@ fn every_algorithm_grust_registers_is_served_with_its_declared_columns() {
     }
 }
 
+/// Whether an Arrow type is, or contains, an unsigned integer.
+fn unsigned(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => true,
+        DataType::List(item)
+        | DataType::LargeList(item)
+        | DataType::ListView(item)
+        | DataType::LargeListView(item)
+        | DataType::FixedSizeList(item, _)
+        | DataType::Map(item, _) => unsigned(item.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| unsigned(f.data_type())),
+        DataType::Dictionary(key, value) => unsigned(key) || unsigned(value),
+        _ => false,
+    }
+}
+
+/// Spark has no unsigned integer types: the Spark Connect client refuses a
+/// `uint64` column outright ("uint64 is not supported in conversion to
+/// Arrow"), so one unsigned column makes a whole read fail. No column Nutmeg
+/// serves may be unsigned, at any depth: every algorithm's result, observed
+/// from a real run, and the graph listing.
+#[test]
+fn no_column_nutmeg_serves_is_unsigned() {
+    let mut schemas = vec![("graphs".to_string(), GraphsTable::arrow_schema())];
+    for name in algorithm_names() {
+        let schema = output_schema(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        schemas.push((name.to_string(), schema));
+    }
+    assert!(algorithm_names().contains(&"pagerank") && algorithm_names().contains(&"degree"));
+    for (name, schema) in &schemas {
+        for field in schema.fields() {
+            assert!(
+                !unsigned(field.data_type()),
+                "{name}.{} is {}, which Spark cannot represent",
+                field.name(),
+                field.data_type()
+            );
+        }
+    }
+    // The check itself sees an unsigned type, including inside a list.
+    assert!(unsigned(&DataType::UInt64));
+    assert!(unsigned(&DataType::new_large_list(DataType::UInt64, true)));
+    assert!(!unsigned(&DataType::Int64));
+}
+
 #[test]
 fn names_resolve_in_either_spelling() {
     assert_eq!(resolve_algorithm("shortest_paths"), Some("shortestPaths"));

@@ -3456,6 +3456,7 @@ name = "grust-algorithms"
 version = "0.22.0"
 dependencies = [
  "arrow-array",
+ "arrow-schema",
  "grust-arrow",
  "grust-core",
  "grust-procedures",
