@@ -1,8 +1,8 @@
 {
   "part1.check.collapsed": {
-    "l1_diff": 0.26338668482409544,
-    "max_abs_diff": 0.004210411635722295,
-    "max_rel_diff": 3.0644036351275408,
+    "l1_diff": 0.2633866848240975,
+    "max_abs_diff": 0.004210411635722317,
+    "max_rel_diff": 3.064403635127502,
     "nodes": 774,
     "top10_same_order": false,
     "top10_same_set": false,
@@ -10,9 +10,9 @@
     "top50_same_set": false
   },
   "part1.check.default": {
-    "l1_diff": 3.673926870554852e-08,
-    "max_abs_diff": 4.841370054202779e-09,
-    "max_rel_diff": 3.507349550309249e-06,
+    "l1_diff": 3.673926518267751e-08,
+    "max_abs_diff": 4.8413700366387036e-09,
+    "max_rel_diff": 3.5073495408118116e-06,
     "nodes": 774,
     "top10_same_order": true,
     "top10_same_set": true,
@@ -30,9 +30,9 @@
     "top50_same_set": true
   },
   "part1.check.tight": {
-    "l1_diff": 4.4265773772173e-13,
-    "max_abs_diff": 8.344605388621584e-14,
-    "max_rel_diff": 6.045152303357613e-11,
+    "l1_diff": 4.370670763243628e-13,
+    "max_abs_diff": 8.345320962055425e-14,
+    "max_rel_diff": 6.045868776714092e-11,
     "nodes": 774,
     "top10_same_order": true,
     "top10_same_set": true,
@@ -110,13 +110,13 @@
     "converged": 1,
     "iterations": 55,
     "nodes": 774,
-    "residual": 9.699506100808563e-09,
-    "score_sum": 0.9999999999999881
+    "residual": 9.699511411095279e-09,
+    "score_sum": 0.999999999999994
   },
   "part1.pagerank_tight_run": {
     "converged": true,
     "iterations": 114,
-    "residual": 9.397661143197011e-14
+    "residual": 9.526244810348361e-14
   },
   "part1.projection_stats": [
     {
@@ -135,61 +135,61 @@
   "part1.top10": [
     {
       "nodeId": 519,
-      "pagerank": 0.006700608017212705,
+      "pagerank": 0.006700608017212726,
       "station_name": "Pershing Square North",
       "trips_in": 15524
     },
     {
       "nodeId": 435,
-      "pagerank": 0.004887936487139483,
+      "pagerank": 0.004887936487139575,
       "station_name": "W 21 St & 6 Ave",
       "trips_in": 11459
     },
     {
       "nodeId": 402,
-      "pagerank": 0.004872273449596034,
+      "pagerank": 0.004872273449596226,
       "station_name": "Broadway & E 22 St",
       "trips_in": 11060
     },
     {
       "nodeId": 492,
-      "pagerank": 0.0047886542221537536,
+      "pagerank": 0.004788654222154027,
       "station_name": "W 33 St & 7 Ave",
       "trips_in": 10762
     },
     {
       "nodeId": 426,
-      "pagerank": 0.004711451346355557,
+      "pagerank": 0.004711451346355584,
       "station_name": "West St & Chambers St",
       "trips_in": 10695
     },
     {
       "nodeId": 497,
-      "pagerank": 0.0043270701557698325,
+      "pagerank": 0.004327070155770081,
       "station_name": "E 17 St & Broadway",
       "trips_in": 9905
     },
     {
       "nodeId": 477,
-      "pagerank": 0.00410698647020213,
+      "pagerank": 0.00410698647020217,
       "station_name": "W 41 St & 8 Ave",
       "trips_in": 9426
     },
     {
       "nodeId": 285,
-      "pagerank": 0.003910522938553279,
+      "pagerank": 0.003910522938553251,
       "station_name": "Broadway & E 14 St",
       "trips_in": 8896
     },
     {
       "nodeId": 462,
-      "pagerank": 0.0039075924055528765,
+      "pagerank": 0.003907592405552844,
       "station_name": "W 22 St & 10 Ave",
       "trips_in": 9176
     },
     {
       "nodeId": 379,
-      "pagerank": 0.0037079908595506568,
+      "pagerank": 0.00370799085955057,
       "station_name": "W 31 St & 7 Ave",
       "trips_in": 8640
     }
@@ -218,7 +218,7 @@
       "station_name": "Schermerhorn St & Bond St"
     },
     {
-      "betweenness": 15928.16666666667,
+      "betweenness": 15928.166666666666,
       "communityId": "72",
       "station_name": "W 43 St & 6 Ave"
     },
@@ -228,12 +228,12 @@
       "station_name": "45 Rd & 11 St"
     },
     {
-      "betweenness": 14820.833333333332,
+      "betweenness": 14820.833333333334,
       "communityId": "72",
       "station_name": "Broadway & W 41 St"
     },
     {
-      "betweenness": 14538.666666666666,
+      "betweenness": 14538.666666666668,
       "communityId": "245",
       "station_name": "Lawrence St & Willoughby St"
     },
@@ -248,7 +248,7 @@
       "station_name": "Broadway & E 22 St"
     },
     {
-      "betweenness": 12243.499999999998,
+      "betweenness": 12243.500000000002,
       "communityId": "532",
       "station_name": "N 6 St & Bedford Ave"
     },
@@ -265,7 +265,7 @@
     "same_path": true
   },
   "part2.check.betweenness": {
-    "max_abs_diff": 5.4569682106375694e-12,
+    "max_abs_diff": 3.637978807091713e-12,
     "max_score": 28906.25,
     "nodes": 761
   },
@@ -284,9 +284,9 @@
     "nutmeg": 0.44113566145549504
   },
   "part2.check.weighted": {
-    "l1_diff": 3.899440641254846e-08,
-    "max_abs_diff": 7.640176052795336e-09,
-    "max_rel_diff": 5.665475225712054e-06,
+    "l1_diff": 3.899440580604576e-08,
+    "max_abs_diff": 7.640176057348985e-09,
+    "max_rel_diff": 5.665475229088755e-06,
     "nodes": 772,
     "top10_same_order": true,
     "top10_same_set": true,
@@ -401,8 +401,8 @@
     "with_coordinates": 774,
     "with_moving_coordinates": 0
   },
-  "part2.corr_mean_minutes_vs_rise": 0.5363851572768149,
-  "part2.dijkstra_read": "nutmeg: `dijkstra` produced [Field { name: \"nodeId\", data_type: Utf8 }, Field { name: \"distance\", data_type: Float64, nullable: true }], declared [Field { name: \"nodeId\", data_type: Utf8 }, Field { name: \"distance\", data_type: Float64 }]",
+  "part2.corr_mean_minutes_vs_rise": 0.5363851572768145,
+  "part2.dijkstra_unreachable": 4,
   "part2.excluded_long_trips": {
     "longest_minutes": 111781.68,
     "trips_over_180_min": 2025
@@ -443,7 +443,7 @@
       "station_name": "Schermerhorn St & Bond St"
     },
     {
-      "betweenness": 15928.16666666667,
+      "betweenness": 15928.166666666666,
       "community": "72",
       "minutes_rank": 121,
       "pagerank_rank": 138,
@@ -457,20 +457,19 @@
       "station_name": "45 Rd & 11 St"
     },
     {
-      "betweenness": 14820.833333333332,
+      "betweenness": 14820.833333333334,
       "community": "72",
       "minutes_rank": 18,
       "pagerank_rank": 19,
       "station_name": "Broadway & W 41 St"
     }
   ],
-  "part2.stage_join_direct": "Invalid HashJoinExec, unsupported PartitionMode Auto in execute()",
   "part2.station_metrics_rows": 774,
   "part2.weighted_fallers": [
     {
-      "mean_minutes_in": 9.683683360258483,
+      "mean_minutes_in": 9.683683360258481,
       "pagerank_minutes": 0.0010941218755679625,
-      "pagerank_trips": 0.001976145006378735,
+      "pagerank_trips": 0.0019761450063787546,
       "rank_by_minutes": 356,
       "rank_by_trips": 134,
       "rise": -222,
@@ -479,8 +478,8 @@
     },
     {
       "mean_minutes_in": 8.18817411402157,
-      "pagerank_minutes": 0.0008405868557449716,
-      "pagerank_trips": 0.0014497072986509407,
+      "pagerank_minutes": 0.0008405868557449705,
+      "pagerank_trips": 0.0014497072986509457,
       "rank_by_minutes": 466,
       "rank_by_trips": 257,
       "rise": -209,
@@ -489,8 +488,8 @@
     },
     {
       "mean_minutes_in": 8.45925690695459,
-      "pagerank_minutes": 0.0016225847634551548,
-      "pagerank_trips": 0.0026612408874644314,
+      "pagerank_minutes": 0.0016225847634551533,
+      "pagerank_trips": 0.0026612408874643555,
       "rank_by_minutes": 218,
       "rank_by_trips": 51,
       "rise": -167,
@@ -498,9 +497,9 @@
       "trips_in": 3149
     },
     {
-      "mean_minutes_in": 8.422801650051566,
-      "pagerank_minutes": 0.0015725657740686568,
-      "pagerank_trips": 0.002446721240695328,
+      "mean_minutes_in": 8.422801650051564,
+      "pagerank_minutes": 0.0015725657740686574,
+      "pagerank_trips": 0.002446721240695264,
       "rank_by_minutes": 229,
       "rank_by_trips": 66,
       "rise": -163,
@@ -509,7 +508,7 @@
     },
     {
       "mean_minutes_in": 10.946242774566475,
-      "pagerank_minutes": 0.0012053894448727398,
+      "pagerank_minutes": 0.0012053894448727366,
       "pagerank_trips": 0.0018732715828716584,
       "rank_by_minutes": 314,
       "rank_by_trips": 160,
@@ -521,8 +520,8 @@
   "part2.weighted_risers": [
     {
       "mean_minutes_in": 25.112106084243365,
-      "pagerank_minutes": 0.0012799069521418967,
-      "pagerank_trips": 0.000792359296664106,
+      "pagerank_minutes": 0.001279906952141898,
+      "pagerank_trips": 0.0007923592966640979,
       "rank_by_minutes": 290,
       "rank_by_trips": 534,
       "rise": 244,
@@ -531,8 +530,8 @@
     },
     {
       "mean_minutes_in": 22.979288256227758,
-      "pagerank_minutes": 0.001298874228462483,
-      "pagerank_trips": 0.000819704998605182,
+      "pagerank_minutes": 0.0012988742284624835,
+      "pagerank_trips": 0.0008197049986051708,
       "rank_by_minutes": 289,
       "rank_by_trips": 522,
       "rise": 233,
@@ -541,8 +540,8 @@
     },
     {
       "mean_minutes_in": 24.682148997134664,
-      "pagerank_minutes": 0.0010617613152485417,
-      "pagerank_trips": 0.0006659688896128964,
+      "pagerank_minutes": 0.0010617613152485415,
+      "pagerank_trips": 0.0006659688896128882,
       "rank_by_minutes": 372,
       "rank_by_trips": 596,
       "rise": 224,
@@ -550,9 +549,9 @@
       "trips_in": 1047
     },
     {
-      "mean_minutes_in": 25.26907258064517,
-      "pagerank_minutes": 0.001268915308262074,
-      "pagerank_trips": 0.0008610529780238861,
+      "mean_minutes_in": 25.269072580645165,
+      "pagerank_minutes": 0.0012689153082620734,
+      "pagerank_trips": 0.0008610529780238778,
       "rank_by_minutes": 291,
       "rank_by_trips": 498,
       "rise": 207,
@@ -560,9 +559,9 @@
       "trips_in": 1240
     },
     {
-      "mean_minutes_in": 20.319456521739134,
-      "pagerank_minutes": 0.0011350223892270283,
-      "pagerank_trips": 0.0008218388026900084,
+      "mean_minutes_in": 20.31945652173913,
+      "pagerank_minutes": 0.0011350223892270309,
+      "pagerank_trips": 0.0008218388026900014,
       "rank_by_minutes": 334,
       "rank_by_trips": 520,
       "rise": 186,
@@ -571,8 +570,8 @@
     },
     {
       "mean_minutes_in": 20.13752398081535,
-      "pagerank_minutes": 0.0013144816925822248,
-      "pagerank_trips": 0.0009252995111538003,
+      "pagerank_minutes": 0.0013144816925822252,
+      "pagerank_trips": 0.0009252995111537888,
       "rank_by_minutes": 283,
       "rank_by_trips": 459,
       "rise": 176,
@@ -581,8 +580,8 @@
     },
     {
       "mean_minutes_in": 19.54594089526293,
-      "pagerank_minutes": 0.0017312685256830591,
-      "pagerank_trips": 0.0011773069827396177,
+      "pagerank_minutes": 0.0017312685256830613,
+      "pagerank_trips": 0.0011773069827396296,
       "rank_by_minutes": 195,
       "rank_by_trips": 352,
       "rise": 157,
@@ -591,8 +590,8 @@
     },
     {
       "mean_minutes_in": 20.974567445674456,
-      "pagerank_minutes": 0.0018960426107186247,
-      "pagerank_trips": 0.0012559725167061227,
+      "pagerank_minutes": 0.0018960426107186253,
+      "pagerank_trips": 0.0012559725167061381,
       "rank_by_minutes": 164,
       "rank_by_trips": 316,
       "rise": 152,
@@ -601,8 +600,8 @@
     },
     {
       "mean_minutes_in": 17.725796486977593,
-      "pagerank_minutes": 0.001248161452897452,
-      "pagerank_trips": 0.0009532296486212333,
+      "pagerank_minutes": 0.001248161452897455,
+      "pagerank_trips": 0.0009532296486212319,
       "rank_by_minutes": 300,
       "rank_by_trips": 447,
       "rise": 147,
@@ -610,9 +609,9 @@
       "trips_in": 1651
     },
     {
-      "mean_minutes_in": 17.786474226804124,
-      "pagerank_minutes": 0.0010613551485088237,
-      "pagerank_trips": 0.0008366334004911706,
+      "mean_minutes_in": 17.78647422680412,
+      "pagerank_minutes": 0.001061355148508826,
+      "pagerank_trips": 0.0008366334004911611,
       "rank_by_minutes": 373,
       "rank_by_trips": 513,
       "rise": 140,
@@ -623,17 +622,17 @@
   "part2.weighted_top10": [
     {
       "mean_minutes_in": 12.833404008506799,
-      "pagerank_minutes": 0.0071446572807659725,
-      "pagerank_trips": 0.0067103522177072725,
+      "pagerank_minutes": 0.007144657280766022,
+      "pagerank_trips": 0.006710352217707605,
       "rank_by_minutes": 1,
       "rank_by_trips": 1,
       "station_name": "Pershing Square North",
       "trips_in": 15517
     },
     {
-      "mean_minutes_in": 17.994255239520953,
-      "pagerank_minutes": 0.006703935515772005,
-      "pagerank_trips": 0.004715257478403746,
+      "mean_minutes_in": 17.994255239520957,
+      "pagerank_minutes": 0.006703935515772033,
+      "pagerank_trips": 0.004715257478403413,
       "rank_by_minutes": 2,
       "rank_by_trips": 5,
       "station_name": "West St & Chambers St",
@@ -641,8 +640,8 @@
     },
     {
       "mean_minutes_in": 12.14767727930536,
-      "pagerank_minutes": 0.005092752363774367,
-      "pagerank_trips": 0.004878337744521643,
+      "pagerank_minutes": 0.0050927523637743785,
+      "pagerank_trips": 0.004878337744521672,
       "rank_by_minutes": 3,
       "rank_by_trips": 3,
       "station_name": "Broadway & E 22 St",
@@ -650,17 +649,17 @@
     },
     {
       "mean_minutes_in": 19.947474058280022,
-      "pagerank_minutes": 0.004933659710937826,
-      "pagerank_trips": 0.0032200610777705654,
+      "pagerank_minutes": 0.004933659710937818,
+      "pagerank_trips": 0.0032200610777705185,
       "rank_by_minutes": 4,
       "rank_by_trips": 21,
       "station_name": "12 Ave & W 40 St",
       "trips_in": 7035
     },
     {
-      "mean_minutes_in": 12.116566248256623,
-      "pagerank_minutes": 0.004896958779776214,
-      "pagerank_trips": 0.004876626122261506,
+      "mean_minutes_in": 12.116566248256621,
+      "pagerank_minutes": 0.004896958779776207,
+      "pagerank_trips": 0.0048766261222612925,
       "rank_by_minutes": 5,
       "rank_by_trips": 4,
       "station_name": "W 33 St & 7 Ave",
@@ -668,26 +667,26 @@
     },
     {
       "mean_minutes_in": 11.4772555012225,
-      "pagerank_minutes": 0.004803901583394153,
-      "pagerank_trips": 0.004893723736035883,
+      "pagerank_minutes": 0.004803901583394161,
+      "pagerank_trips": 0.00489372373603592,
       "rank_by_minutes": 6,
       "rank_by_trips": 2,
       "station_name": "W 21 St & 6 Ave",
       "trips_in": 11452
     },
     {
-      "mean_minutes_in": 14.074387343153305,
-      "pagerank_minutes": 0.004525014288737429,
-      "pagerank_trips": 0.0039093715761410915,
+      "mean_minutes_in": 14.074387343153306,
+      "pagerank_minutes": 0.004525014288737475,
+      "pagerank_trips": 0.003909371576141052,
       "rank_by_minutes": 7,
       "rank_by_trips": 9,
       "station_name": "W 22 St & 10 Ave",
       "trips_in": 9165
     },
     {
-      "mean_minutes_in": 12.678742572156201,
-      "pagerank_minutes": 0.004325506937753842,
-      "pagerank_trips": 0.004112378461695134,
+      "mean_minutes_in": 12.6787425721562,
+      "pagerank_minutes": 0.004325506937753817,
+      "pagerank_trips": 0.0041123784616950085,
       "rank_by_minutes": 8,
       "rank_by_trips": 7,
       "station_name": "W 41 St & 8 Ave",
@@ -695,8 +694,8 @@
     },
     {
       "mean_minutes_in": 11.306260228305884,
-      "pagerank_minutes": 0.00423581283586706,
-      "pagerank_trips": 0.004331937010604076,
+      "pagerank_minutes": 0.00423581283586707,
+      "pagerank_trips": 0.004331937010603998,
       "rank_by_minutes": 9,
       "rank_by_trips": 6,
       "station_name": "E 17 St & Broadway",
@@ -704,8 +703,8 @@
     },
     {
       "mean_minutes_in": 17.064244457409572,
-      "pagerank_minutes": 0.004212669789509716,
-      "pagerank_trips": 0.0031821741645119118,
+      "pagerank_minutes": 0.004212669789509722,
+      "pagerank_trips": 0.003182174164511922,
       "rank_by_minutes": 10,
       "rank_by_trips": 23,
       "station_name": "South End Ave & Liberty St",
@@ -713,9 +712,9 @@
     }
   ],
   "versions": {
-    "grust commit": "4d8e5dbd37e6d729cd11136a92d81dac18434496",
+    "grust commit": "db00ee7708b7c0d97978b26cf235bab577a88428",
     "host": "Linux 6.12.107+deb13-cloud-amd64 x86_64",
-    "nutmeg commit": "7566ff0caeb9f05e579a4f148a3be5e6532f8c0e",
+    "nutmeg commit": "f727f4de9676832d5fa5a7478e8bb07f1e42f5b9",
     "pyspark (client)": "4.2.0",
     "python (client)": "3.13.5",
     "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",

@@ -27,8 +27,8 @@ during the run recorded there, and nothing below was typed in by hand.
 
 | component | version |
 |---|---|
-| grust commit | 4d8e5dbd37e6d729cd11136a92d81dac18434496 |
-| nutmeg commit | 7566ff0caeb9f05e579a4f148a3be5e6532f8c0e (this example is committed on top of it) |
+| grust commit | db00ee7708b7c0d97978b26cf235bab577a88428 |
+| nutmeg commit | f727f4de9676832d5fa5a7478e8bb07f1e42f5b9 (these results are committed on top of it) |
 | sail commit | f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f (upstream `lakehq/sail` main, which contains the session-factory hook from #2630) |
 | pyspark (client) | 4.2.0 (`pyspark-client`) |
 | server Spark version (spark.version) | 4.2.0 |
@@ -121,7 +121,7 @@ failure and then gives the same eleven columns explicitly.
 | 774 | 1595334 | 1595334 | 26234 | 25531544 |
 
 **Step 3: PageRank.** It converged in 55 iterations, with a last L1 change
-of 9.69950610081e-09 and scores summing to 1 over 774 nodes. The result
+of 9.6995114111e-09 and scores summing to 1 over 774 nodes. The result
 schema, cast to the tutorial's shape, is
 `struct<nodeId:bigint,pagerank:double>`.
 
@@ -186,7 +186,7 @@ Observed agreement, over all 774 stations:
 |---|---|---|---|---|---|
 | NetworkX vs NumPy reference | 5.515e-14 | 2.866e-13 | 3.995e-11 | same | same |
 | Nutmeg, default tolerance (stops at L1 change ≤ 1e-8) vs NumPy | 4.841e-09 | 3.674e-08 | 3.507e-06 | same | same |
-| Nutmeg, `tolerance` 1e-13 (114 iterations, converged) vs NumPy | 8.345e-14 | 4.427e-13 | 6.045e-11 | same | same |
+| Nutmeg, `tolerance` 1e-13 (114 iterations, converged) vs NumPy | 8.345e-14 | 4.371e-13 | 6.046e-11 | same | same |
 | Nutmeg, default, vs a reference that **collapses** parallel edges | 4.210e-03 | 2.634e-01 | 3.064e+00 | differs | differs |
 
 What these results show:
@@ -358,9 +358,9 @@ stations far more often than their PageRank suggests: Queens Plaza North is
 
 **Reference check.** NetworkX's `betweenness_centrality(weight=...,
 normalized=False)` ran on the same link table, read back from Delta. Over
-761 nodes the largest abs diff was 5.457e-12, with a largest score of
+761 nodes the largest abs diff was 3.638e-12, with a largest score of
 28906.2, and the top 10 are in the same order. The previous run printed
-3.638e-12, so the difference is floating-point summation order, not an
+1.819e-12, so the difference is floating-point summation order, not an
 exact match.
 
 ### Results written back to Delta, joined to names
@@ -402,8 +402,13 @@ The route covers 12915.0 m over 2 links, against a straight line of
 12785.1 m, and the search settled 78 stations. The route is short in hops
 because Pershing Square North has regular links to much of the network.
 
+The route graph is staged straight from the two SQL queries that build it,
+each of which joins the link table to the station coordinates; nothing is
+written to Delta first. Nutmeg's `dijkstra` from the start station reads 4
+stations as unreachable, with a NULL distance.
+
 **Reference check.** The A* total of 12914.980413 m equals Nutmeg's
-`shortestPaths` (Dijkstra) and NetworkX's `dijkstra_path_length` on the same
+`dijkstra` and NetworkX's `dijkstra_path_length` on the same
 edges; the largest pairwise difference printed is 0.000e+00 m. NetworkX's
 path is the same sequence of stations.
 
@@ -412,15 +417,6 @@ path is the same sequence of stations.
 - **`inferSchema=True` on the Kaggle CSV** fails in Sail `f1cf1729` with
   `cast Timestamp(Second, None) to Spark data type`. The script gives the
   schema explicitly.
-- **Staging a DataFrame whose plan contains a join** fails in this Nutmeg
-  build with `Invalid HashJoinExec, unsupported PartitionMode Auto in
-  execute()`. The Nutmeg sink collects its input inside `insert_into`,
-  apparently before Sail has finished physical planning; that is a reading
-  of the code and has not been confirmed. The script tries it, reports the
-  error, and stages the route tables from Delta instead.
-- **The Nutmeg `dijkstra` read** fails with a schema mismatch: the kernel
-  produces a nullable `distance`, and Nutmeg declares it non-nullable. The
-  cross-check uses `shortestPaths` instead.
 - During development, and not in the captured run, overwriting an existing
   Delta table from a query with a `LEFT JOIN` to a Nutmeg table function
   failed with `DELTA_NOT_NULL_CONSTRAINT_VIOLATED`, and an earlier
