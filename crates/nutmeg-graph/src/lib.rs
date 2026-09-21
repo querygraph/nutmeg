@@ -26,9 +26,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use arrow::array::{Array, ArrayRef, Int64Array, StringArray, new_null_array};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float64Array, Int64Array, StringArray,
+    new_null_array,
+};
 use arrow::compute::{cast, is_not_null};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Float32Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunction, TableFunctionImpl, TableProvider};
@@ -38,7 +41,8 @@ use datafusion::prelude::SessionContext;
 use datafusion_common::{DataFusionError, Result, ScalarValue, exec_err, plan_err};
 use datafusion_expr::{Expr, TableType};
 use grust_algorithms::{
-    ArrowResultCursor, CsrEstimate, GraphProjection, ProjectionOptions, WeightSelection,
+    ArrowResultCursor, CsrEstimate, GraphProjection, NodeProperties, ProjectionOptions,
+    PropertyKind, WeightSelection,
 };
 use grust_core::Value;
 use grust_procedures::{
@@ -211,15 +215,95 @@ fn node_schema() -> SchemaRef {
     ]))
 }
 
-/// Rename node rows into the grust-arrow layout: `node_id`, `label`.
+/// Rename node rows into the grust-arrow layout: `node_id`, `label`, and for
+/// every other column `c` a kernel could read as a node property, the pair
+/// `property.c` and `present.c`. Integers become Int64 and other numbers
+/// Float64, as on edges; strings stay Utf8, for categories; fixed-size lists
+/// of floats stay as they are, for vectors. Columns already named
+/// `property.*`/`present.*` pass through.
+///
+/// Until these were kept, every node column but the id and label was dropped
+/// here, so no kernel that reads node properties could run on a staged graph.
 pub fn normalize_nodes(batch: &RecordBatch, mapping: &ColumnMapping) -> Result<RecordBatch> {
     let rows = batch.num_rows();
-    let (id, _) = pick(batch, &mapping.id, &["node_id", "id"], "node id", true)?.expect("required");
-    let label = match pick(batch, &mapping.label, &["label"], "node label", false)? {
-        Some((column, _)) => utf8(column)?,
-        None => constant("", rows),
-    };
-    Ok(RecordBatch::try_new(node_schema(), vec![utf8(id)?, label])?)
+    let (id, id_name) =
+        pick(batch, &mapping.id, &["node_id", "id"], "node id", true)?.expect("required");
+    let label = pick(batch, &mapping.label, &["label"], "node label", false)?;
+    let mut fields: Vec<Field> = node_schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    let mut columns: Vec<ArrayRef> = vec![
+        utf8(id)?,
+        match &label {
+            Some((column, _)) => utf8(column)?,
+            None => constant("", rows),
+        },
+    ];
+    let mut used: HashSet<String> = [id_name].into();
+    used.extend(label.map(|(_, name)| name));
+    lift_properties(batch, &used, Lift::Node, &mut fields, &mut columns)?;
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
+}
+
+/// Which column kinds become properties: edges carry weights, which are
+/// numbers; nodes also carry categories and vectors.
+#[derive(Clone, Copy, PartialEq)]
+enum Lift {
+    Edge,
+    Node,
+}
+
+/// Append `property.c` + `present.c` for every unused column `c` of a kind
+/// `lift` admits, and pass `property.*`/`present.*` columns through.
+fn lift_properties(
+    batch: &RecordBatch,
+    used: &HashSet<String>,
+    lift: Lift,
+    fields: &mut Vec<Field>,
+    columns: &mut Vec<ArrayRef>,
+) -> Result<()> {
+    let schema = batch.schema();
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        let name = field.name();
+        if used.contains(name) {
+            continue;
+        }
+        if name.starts_with("property.") || name.starts_with("present.") {
+            fields.push(field.as_ref().clone());
+            columns.push(column.clone());
+            continue;
+        }
+        let kind = field.data_type();
+        let values = if kind.is_integer() {
+            cast(column, &DataType::Int64)?
+        } else if kind.is_numeric() {
+            cast(column, &DataType::Float64)?
+        } else if lift == Lift::Node && matches!(kind, DataType::Utf8 | DataType::LargeUtf8) {
+            cast(column, &DataType::Utf8)?
+        } else if lift == Lift::Node && matches!(kind, DataType::FixedSizeList(..)) {
+            column.clone()
+        } else {
+            continue;
+        };
+        fields.push(Field::new(
+            format!("property.{name}"),
+            values.data_type().clone(),
+            true,
+        ));
+        columns.push(values);
+        fields.push(Field::new(
+            format!("present.{name}"),
+            DataType::Boolean,
+            false,
+        ));
+        columns.push(Arc::new(is_not_null(column)?));
+    }
+    Ok(())
 }
 
 /// Rename edge rows into the grust-arrow layout: `source`, `target`, `label`,
@@ -278,38 +362,7 @@ pub fn normalize_edges(batch: &RecordBatch, mapping: &ColumnMapping) -> Result<R
     ];
     let mut used: HashSet<String> = [source_name, target_name].into();
     used.extend(label.into_iter().chain(edge_id).map(|(_, name)| name));
-    let schema = batch.schema();
-    for (field, column) in schema.fields().iter().zip(batch.columns()) {
-        let name = field.name();
-        if used.contains(name) {
-            continue;
-        }
-        if name.starts_with("property.") || name.starts_with("present.") {
-            fields.push(field.as_ref().clone());
-            columns.push(column.clone());
-            continue;
-        }
-        let kind = field.data_type();
-        let values = if kind.is_integer() {
-            cast(column, &DataType::Int64)?
-        } else if kind.is_numeric() {
-            cast(column, &DataType::Float64)?
-        } else {
-            continue;
-        };
-        fields.push(Field::new(
-            format!("property.{name}"),
-            values.data_type().clone(),
-            true,
-        ));
-        columns.push(values);
-        fields.push(Field::new(
-            format!("present.{name}"),
-            DataType::Boolean,
-            false,
-        ));
-        columns.push(Arc::new(is_not_null(column)?));
-    }
+    lift_properties(batch, &used, Lift::Edge, &mut fields, &mut columns)?;
     Ok(RecordBatch::try_new(
         Arc::new(Schema::new(fields)),
         columns,
@@ -437,6 +490,22 @@ impl Registry {
 
     /// The projection of `name` under the projection options in `args`,
     /// built on first use and kept until the graph is staged again.
+    /// The node batches a projection of `name` is built from: those staged,
+    /// or, when only edges were staged, the endpoints derived from them. A
+    /// kernel's node properties are read from these, row-aligned with the
+    /// projection by node id.
+    fn node_batches(name: &str) -> Result<Vec<RecordBatch>> {
+        let Some(entry) = Self::entry(name, false)? else {
+            return exec_err!("nutmeg: no graph named `{name}`; stage its rows first");
+        };
+        let e = entry.read().map_err(|_| poisoned())?;
+        if e.nodes.is_empty() {
+            Ok(vec![derive_nodes(&e.edges)?])
+        } else {
+            Ok(e.nodes.clone())
+        }
+    }
+
     pub fn projection(name: &str, args: &ValidatedArguments) -> Result<GraphProjection> {
         let Some(entry) = Self::entry(name, false)? else {
             return exec_err!("nutmeg: no graph named `{name}`; stage its rows first");
@@ -701,8 +770,24 @@ pub fn run(
         }
         // Every projection kernel Grust registers, by name: Grust finds the
         // kernel, reads its options and returns its typed Arrow results, so a
-        // new registration is served here with no code of Nutmeg's own.
-        _ => grust_algorithm_procedures::run_on_projection(algorithm, g, args).map_err(err)?,
+        // new registration is served here with no code of Nutmeg's own. A
+        // kernel that reads node properties names them through its options;
+        // they are read from the staged node rows and handed over with the
+        // projection. One that reads none takes the projection alone, so the
+        // common path builds nothing extra.
+        _ => {
+            let wanted =
+                grust_algorithm_procedures::node_property_requests(algorithm, args).map_err(err)?;
+            if wanted.is_empty() {
+                grust_algorithm_procedures::run_on_projection(algorithm, g, args).map_err(err)?
+            } else {
+                let nodes = Registry::node_batches(graph_name)?;
+                let properties =
+                    NodeProperties::from_arrow_batches(&nodes, g, &wanted).map_err(err)?;
+                grust_algorithm_procedures::run_with_properties(algorithm, &properties, args)
+                    .map_err(err)?
+            }
+        }
     };
     drain(cursor)
 }
@@ -726,7 +811,87 @@ fn probe_args(algorithm: &str, orientation: Option<&str>) -> Result<ValidatedArg
             options.insert(argument.field.name.clone(), value);
         }
     }
+    // A kernel that reads node properties would otherwise name its defaults,
+    // which the probe graph does not have; point each at the probe's column.
+    // Only projection kernels declare properties: `estimateCsr` and
+    // `projectionStats` are served here by hand and have none to declare.
+    if grust_algorithm_procedures::projection_kernel_names().contains(&algorithm) {
+        for declared in grust_algorithm_procedures::node_property_options(algorithm).map_err(err)? {
+            options.insert(
+                declared.option.to_string(),
+                serde_json::json!(probe_key(declared.option, declared.kind)),
+            );
+        }
+    }
     validate(algorithm, &options)
+}
+
+/// The probe column standing in for one declared property option. Keyed by
+/// option and kind together, so two kernels that happen to share an option name
+/// with different kinds do not collide.
+fn probe_key(option: &str, kind: PropertyKind) -> String {
+    let kind = match kind {
+        PropertyKind::Number => "number",
+        PropertyKind::Integer => "integer",
+        PropertyKind::Vector => "vector",
+        PropertyKind::Category => "category",
+    };
+    format!("probe.{option}.{kind}")
+}
+
+/// The probe's three nodes, carrying a column for every property option any
+/// registered kernel declares. Values are chosen to be valid for every reader:
+/// numbers lie within ±90, so they serve as latitudes and longitudes; integers
+/// split the nodes into two communities; vectors are distinct and nonzero.
+fn probe_nodes() -> Result<RecordBatch> {
+    let ids: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+    let mut fields = vec![
+        Field::new("node_id", DataType::Utf8, false),
+        Field::new("label", DataType::Utf8, true),
+    ];
+    let mut columns: Vec<ArrayRef> = vec![ids, Arc::new(StringArray::from(vec!["", "", ""]))];
+    let mut seen = HashSet::new();
+    for name in grust_algorithm_procedures::projection_kernel_names() {
+        for declared in grust_algorithm_procedures::node_property_options(name).map_err(err)? {
+            let key = probe_key(declared.option, declared.kind);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let values: ArrayRef = match declared.kind {
+                PropertyKind::Number => Arc::new(Float64Array::from(vec![0.0, 0.5, 1.0])),
+                PropertyKind::Integer => Arc::new(Int64Array::from(vec![0, 1, 0])),
+                PropertyKind::Category => Arc::new(StringArray::from(vec!["x", "y", "x"])),
+                PropertyKind::Vector => {
+                    Arc::new(
+                        FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                            vec![
+                                Some(vec![Some(1.0), Some(0.0)]),
+                                Some(vec![Some(0.0), Some(1.0)]),
+                                Some(vec![Some(1.0), Some(1.0)]),
+                            ],
+                            2,
+                        ),
+                    )
+                }
+            };
+            fields.push(Field::new(
+                format!("property.{key}"),
+                values.data_type().clone(),
+                true,
+            ));
+            columns.push(values);
+            fields.push(Field::new(
+                format!("present.{key}"),
+                DataType::Boolean,
+                false,
+            ));
+            columns.push(Arc::new(BooleanArray::from(vec![true, true, true])));
+        }
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
 }
 
 const PROBE: &str = "nutmeg.schema-probe";
@@ -755,6 +920,13 @@ pub fn output_schema(algorithm: &str) -> Result<SchemaRef> {
             PROBE,
             Part::Edges,
             &[edges],
+            &ColumnMapping::default(),
+            true,
+        )?;
+        Registry::stage(
+            PROBE,
+            Part::Nodes,
+            &[probe_nodes()?],
             &ColumnMapping::default(),
             true,
         )?;

@@ -298,3 +298,103 @@ async fn every_algorithm_runs_through_sql() -> Result<()> {
     assert!(format!("{:?}", error.err()).contains("no graph named"));
     Ok(())
 }
+
+/// Node properties arrive the way a Spark DataFrame hands them over: raw column
+/// names, narrower types than a kernel reads, and rows in no particular order.
+/// Until staging kept them, every node column but the id and label was dropped,
+/// so no kernel that reads node properties could run on a staged graph.
+///
+/// The check is a value, not a presence. Two triangles joined by one edge,
+/// partitioned into the triangles, have modularity 5/14 by hand: m = 7 edges,
+/// each triangle has 3 internal edges and degree total 7, so
+/// Q = 2 * (3/7 - (7/14)^2) = 5/14. Nodes are staged in reverse, so a row
+/// misalignment between the staged columns and the projection would scramble
+/// the partition and change Q, not merely fail to find it. Both failures were
+/// checked by breaking the fix on purpose: dropping node columns, and
+/// misassigning communities to rows, each fail this test.
+#[test]
+fn staged_node_columns_reach_the_kernels_that_read_them() {
+    let name = "node-properties";
+    let nodes = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            // Int32 and Float32: narrower than the kernels read, so staging casts.
+            Field::new("community", DataType::Int32, false),
+            Field::new("lat", DataType::Float32, false),
+            Field::new("lon", DataType::Float32, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["f", "e", "d", "c", "b", "a"])),
+            Arc::new(Int32Array::from(vec![1, 1, 1, 0, 0, 0])),
+            // One point for every node: the heuristic is zero, so A* is
+            // Dijkstra and its answer is the shortest hop count.
+            Arc::new(arrow::array::Float32Array::from(vec![10.0; 6])),
+            Arc::new(arrow::array::Float32Array::from(vec![20.0; 6])),
+        ],
+    )
+    .unwrap();
+    let mapping = ColumnMapping::default();
+    Registry::stage(name, Part::Nodes, &[nodes], &mapping, true).unwrap();
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[edges(
+            &["a", "b", "c", "c", "d", "e", "f"],
+            &["b", "c", "a", "d", "e", "f", "d"],
+            None,
+        )],
+        &mapping,
+        true,
+    )
+    .unwrap();
+
+    let options: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
+        serde_json::json!({ "orientation": "undirected", "communityProperty": "community" }),
+    )
+    .unwrap();
+    let batches = run(
+        "modularity",
+        name,
+        &validate("modularity", &options).unwrap(),
+    )
+    .unwrap();
+    let batch = &batches[0];
+    let sizes = batch
+        .column_by_name("size")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2, "one row per community");
+    assert!(sizes.iter().all(|size| size == Some(3)), "{sizes:?}");
+    let total = batch
+        .column_by_name("totalModularity")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .value(0);
+    // A sum of a few terms against a hand-computed quotient: equal to within
+    // rounding, not bit for bit.
+    assert!((total - 5.0 / 14.0).abs() < 1e-12, "modularity {total}");
+
+    let options: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_value(serde_json::json!({
+            "source": "a", "target": "f", "orientation": "undirected",
+            "latitudeProperty": "lat", "longitudeProperty": "lon",
+        }))
+        .unwrap();
+    let batches = run("astar", name, &validate("astar", &options).unwrap()).unwrap();
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    // a - c - d - f: three hops, four nodes on the path.
+    assert_eq!(rows, 4, "{batches:?}");
+    let total = batches[0]
+        .column_by_name("totalCost")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 3.0);
+    assert!(Registry::drop(name).unwrap());
+}
