@@ -25,12 +25,17 @@ grust-core = { workspace = true }
 # The bounded channel a streaming read's kernel thread feeds.
 tokio = { workspace = true }
 
-[features]
-# The SQL surface, for tests that go through `ctx.sql`. Off by default because
-# DataFusion's `sql` feature adds an error variant that Sail's exhaustive match
-# over `DataFusionError` does not cover, so a build that enables it cannot also
-# build `nutmeg-sail`. Nutmeg's own SQL table functions do not need it.
-sql = ["datafusion/sql"]
-
 [dev-dependencies]
 tokio = { workspace = true }
+# The tests that go through `ctx.sql` need DataFusion's SQL parser. It is a
+# feature on this dev-dependency, not a crate feature, so `cargo test -p
+# nutmeg-graph` has it and no dependent of nutmeg-graph does: under Cargo's
+# resolver 2 a dev-dependency's features are unified into a build only when
+# this package's own test, example or bench targets are being built.
+# DataFusion's `sql` feature turns on `datafusion-common/sql`, which adds a
+# `DataFusionError::SQL` variant that Sail's exhaustive match does not cover,
+# so a build of `nutmeg-sail` or `nutmeg-server` must never see it. That is
+# why the gate runs clippy over `nutmeg-graph --all-targets` in one
+# invocation and over `nutmeg-sail`/`nutmeg-server` in another (README,
+# "Building and testing").
+datafusion = { workspace = true, features = ["sql"] }

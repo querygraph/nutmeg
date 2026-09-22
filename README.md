@@ -279,6 +279,36 @@ Nutmeg is a **local-mode** extension: it does not work in Sail's cluster
 modes (`local-cluster`, `kubernetes-cluster`). See the materialised-reads
 note above and `CHANGELOG.md`.
 
+## Building and testing
+
+The gate, run before a commit is pushed, is one `&&` chain:
+
+```sh
+cargo fmt --all -- --check \
+  && cargo clippy -p nutmeg-graph --all-targets -- -D warnings \
+  && cargo clippy -p nutmeg-sail -p nutmeg-server --all-targets -- -D warnings \
+  && cargo test -p nutmeg-graph \
+  && cargo test -p nutmeg-sail --release \
+  && git diff --check
+```
+
+Clippy runs in two invocations, and `nutmeg-graph`'s tests run alone, on
+purpose. Five of `nutmeg-graph`'s tests go through `ctx.sql`, which needs
+DataFusion's `sql` feature. That feature turns on `datafusion-common/sql`,
+which adds a `DataFusionError::SQL` variant that Sail's exhaustive match over
+`DataFusionError` (`sail-common-datafusion/src/error.rs`) does not cover, so
+a build that has it cannot compile `nutmeg-sail` or `nutmeg-server`. The
+feature is therefore on `nutmeg-graph`'s `datafusion` dev-dependency and
+nowhere else. Under Cargo's resolver 2 a dev-dependency's features are
+unified into a build only when that package's own test, example or bench
+targets are being built: `cargo test -p nutmeg-graph` and `cargo clippy -p
+nutmeg-graph --all-targets` have `sql`; `cargo clippy -p nutmeg-sail -p
+nutmeg-server --all-targets` and every build of `nutmeg-server` do not. An
+invocation that builds `nutmeg-graph`'s tests together with `nutmeg-sail`
+(`cargo test --workspace`, `cargo clippy --workspace --all-targets`) fails to
+compile `sail-common-datafusion`; that is the expected outcome, not a
+regression, and the gate above is how the workspace is checked.
+
 ## The twelve
 
 `bfs`, `dfs`, `multiSourceBfs`, `dijkstra`, `shortestPaths`, `wcc`, `scc`,
