@@ -1,7 +1,7 @@
-# three consecutive runs of the same script on grust (nutmeg cec3096, grust fd4e3ec, sail f1cf1729); run 3 is the captured run
-# run 1 start 2026-09-22T00:50:04Z end 2026-09-22T00:51:14Z exit 0
-# run 2 start 2026-09-22T00:51:14Z end 2026-09-22T00:52:22Z exit 0
-# run 3 start 2026-09-22T00:52:22Z end 2026-09-22T00:53:27Z exit 0
+# three consecutive runs of the same script on grust (nutmeg 0480123, grust ca68900, sail f1cf1729); run 3 is the captured run
+# run 1 start 2026-09-22T07:26:36Z end 2026-09-22T07:27:39Z exit 0
+# run 2 start 2026-09-22T07:27:39Z end 2026-09-22T07:28:39Z exit 0
+# run 3 start 2026-09-22T07:28:39Z end 2026-09-22T07:29:40Z exit 0
 
 ## output.md, run 1 -> run 2 (empty: identical)
 
@@ -9,6 +9,10 @@
 identical
 
 ## results.json, run 1 -> run 2 (full precision; the report prints fewer digits)
+404c404
+<   "part2.corr_mean_minutes_vs_rise": 0.5364062638250643,
+---
+>   "part2.corr_mean_minutes_vs_rise": 0.5364062638250641,
 470c470
 <       "mean_minutes_in": 9.683683360258481,
 ---
@@ -16,58 +20,7 @@ identical
 490c490
 <       "mean_minutes_in": 8.45925690695459,
 ---
->       "mean_minutes_in": 8.459256906954588,
-500c500
-<       "mean_minutes_in": 8.422801650051564,
----
->       "mean_minutes_in": 8.422801650051566,
-542c542
-<       "mean_minutes_in": 24.682148997134664,
----
->       "mean_minutes_in": 24.682148997134668,
-552c552
-<       "mean_minutes_in": 25.26907258064516,
----
->       "mean_minutes_in": 25.269072580645165,
-572c572
-<       "mean_minutes_in": 20.13752398081535,
----
->       "mean_minutes_in": 20.137523980815352,
-612c612
-<       "mean_minutes_in": 17.786474226804124,
----
->       "mean_minutes_in": 17.786474226804117,
-669c669
-<       "mean_minutes_in": 11.4772555012225,
----
->       "mean_minutes_in": 11.477255501222501,
-687c687
-<       "mean_minutes_in": 12.678742572156201,
----
->       "mean_minutes_in": 12.6787425721562,
-696c696
-<       "mean_minutes_in": 11.306260228305886,
----
->       "mean_minutes_in": 11.306260228305884,
-
-## output.md, run 1 -> run 3 (empty: identical)
-
-## communities.png, run 1 -> run 3
-identical
-
-## results.json, run 1 -> run 3 (full precision; the report prints fewer digits)
-404c404
-<   "part2.corr_mean_minutes_vs_rise": 0.5364062638250638,
----
->   "part2.corr_mean_minutes_vs_rise": 0.5364062638250641,
-480c480
-<       "mean_minutes_in": 8.18817411402157,
----
->       "mean_minutes_in": 8.188174114021571,
-490c490
-<       "mean_minutes_in": 8.45925690695459,
----
->       "mean_minutes_in": 8.459256906954588,
+>       "mean_minutes_in": 8.459256906954593,
 500c500
 <       "mean_minutes_in": 8.422801650051564,
 ---
@@ -76,6 +29,10 @@ identical
 <       "mean_minutes_in": 10.946242774566477,
 ---
 >       "mean_minutes_in": 10.946242774566475,
+522c522
+<       "mean_minutes_in": 25.112106084243365,
+---
+>       "mean_minutes_in": 25.11210608424337,
 542c542
 <       "mean_minutes_in": 24.682148997134664,
 ---
@@ -83,12 +40,170 @@ identical
 552c552
 <       "mean_minutes_in": 25.26907258064516,
 ---
->       "mean_minutes_in": 25.269072580645158,
+>       "mean_minutes_in": 25.269072580645165,
+562c562
+<       "mean_minutes_in": 20.31945652173913,
+---
+>       "mean_minutes_in": 20.319456521739134,
+572c572
+<       "mean_minutes_in": 20.13752398081535,
+---
+>       "mean_minutes_in": 20.137523980815352,
+602c602
+<       "mean_minutes_in": 17.725796486977593,
+---
+>       "mean_minutes_in": 17.72579648697759,
 624c624
 <       "mean_minutes_in": 12.833404008506799,
 ---
->       "mean_minutes_in": 12.8334040085068,
+>       "mean_minutes_in": 12.833404008506788,
+633c633
+<       "mean_minutes_in": 17.994255239520953,
+---
+>       "mean_minutes_in": 17.99425523952097,
+642c642
+<       "mean_minutes_in": 12.14767727930536,
+---
+>       "mean_minutes_in": 12.147677279305363,
+651c651
+<       "mean_minutes_in": 19.947474058280022,
+---
+>       "mean_minutes_in": 19.947474058280026,
 660c660
-<       "mean_minutes_in": 12.116566248256621,
+<       "mean_minutes_in": 12.116566248256623,
+---
+>       "mean_minutes_in": 12.116566248256616,
+669c669
+<       "mean_minutes_in": 11.477255501222501,
+---
+>       "mean_minutes_in": 11.477255501222507,
+678c678
+<       "mean_minutes_in": 14.074387343153305,
+---
+>       "mean_minutes_in": 14.074387343153314,
+687c687
+<       "mean_minutes_in": 12.6787425721562,
+---
+>       "mean_minutes_in": 12.678742572156207,
+696c696
+<       "mean_minutes_in": 11.306260228305884,
+---
+>       "mean_minutes_in": 11.306260228305879,
+705c705
+<       "mean_minutes_in": 17.064244457409572,
+---
+>       "mean_minutes_in": 17.064244457409576,
+
+## output.md, run 1 -> run 3 (empty: identical)
+
+## communities.png, run 1 -> run 3
+identical
+
+## results.json, run 1 -> run 3 (full precision; the report prints fewer digits)
+404c404
+<   "part2.corr_mean_minutes_vs_rise": 0.5364062638250643,
+---
+>   "part2.corr_mean_minutes_vs_rise": 0.5364062638250638,
+500c500
+<       "mean_minutes_in": 8.422801650051564,
+---
+>       "mean_minutes_in": 8.422801650051566,
+552c552
+<       "mean_minutes_in": 25.26907258064516,
+---
+>       "mean_minutes_in": 25.269072580645165,
+612c612
+<       "mean_minutes_in": 17.786474226804124,
+---
+>       "mean_minutes_in": 17.78647422680412,
+669c669
+<       "mean_minutes_in": 11.477255501222501,
+---
+>       "mean_minutes_in": 11.4772555012225,
+
+## output.md, run 2 -> run 3 (empty: identical)
+
+## communities.png, run 2 -> run 3
+identical
+
+## results.json, run 2 -> run 3 (full precision; the report prints fewer digits)
+404c404
+<   "part2.corr_mean_minutes_vs_rise": 0.5364062638250641,
+---
+>   "part2.corr_mean_minutes_vs_rise": 0.5364062638250638,
+470c470
+<       "mean_minutes_in": 9.68368336025848,
+---
+>       "mean_minutes_in": 9.683683360258481,
+490c490
+<       "mean_minutes_in": 8.459256906954593,
+---
+>       "mean_minutes_in": 8.45925690695459,
+510c510
+<       "mean_minutes_in": 10.946242774566475,
+---
+>       "mean_minutes_in": 10.946242774566477,
+522c522
+<       "mean_minutes_in": 25.11210608424337,
+---
+>       "mean_minutes_in": 25.112106084243365,
+542c542
+<       "mean_minutes_in": 24.682148997134668,
+---
+>       "mean_minutes_in": 24.682148997134664,
+562c562
+<       "mean_minutes_in": 20.319456521739134,
+---
+>       "mean_minutes_in": 20.31945652173913,
+572c572
+<       "mean_minutes_in": 20.137523980815352,
+---
+>       "mean_minutes_in": 20.13752398081535,
+602c602
+<       "mean_minutes_in": 17.72579648697759,
+---
+>       "mean_minutes_in": 17.725796486977593,
+612c612
+<       "mean_minutes_in": 17.786474226804124,
+---
+>       "mean_minutes_in": 17.78647422680412,
+624c624
+<       "mean_minutes_in": 12.833404008506788,
+---
+>       "mean_minutes_in": 12.833404008506799,
+633c633
+<       "mean_minutes_in": 17.99425523952097,
+---
+>       "mean_minutes_in": 17.994255239520953,
+642c642
+<       "mean_minutes_in": 12.147677279305363,
+---
+>       "mean_minutes_in": 12.14767727930536,
+651c651
+<       "mean_minutes_in": 19.947474058280026,
+---
+>       "mean_minutes_in": 19.947474058280022,
+660c660
+<       "mean_minutes_in": 12.116566248256616,
 ---
 >       "mean_minutes_in": 12.116566248256623,
+669c669
+<       "mean_minutes_in": 11.477255501222507,
+---
+>       "mean_minutes_in": 11.4772555012225,
+678c678
+<       "mean_minutes_in": 14.074387343153314,
+---
+>       "mean_minutes_in": 14.074387343153305,
+687c687
+<       "mean_minutes_in": 12.678742572156207,
+---
+>       "mean_minutes_in": 12.6787425721562,
+696c696
+<       "mean_minutes_in": 11.306260228305879,
+---
+>       "mean_minutes_in": 11.306260228305884,
+705c705
+<       "mean_minutes_in": 17.064244457409576,
+---
+>       "mean_minutes_in": 17.064244457409572,

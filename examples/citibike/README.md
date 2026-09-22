@@ -27,9 +27,9 @@ during the run recorded there, and nothing below was typed in by hand.
 
 | component | version |
 |---|---|
-| grust commit | fd4e3ec37fc12a5ab33ede5d5faa182fa277a5c2 (`work/arrow-declared-nullability`) |
-| nutmeg commit | cec30960d4f33dd866693ad437311889b7caa155 (`work/canonical-order`: 1492ca2 plus a live test; these results are committed on top of it) |
-| sail commit | f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f (upstream `lakehq/sail` main, which contains the session-factory hook from #2630) |
+| grust commit | ca6890053fba0e1bb1b7581d876dd0a1d1ad7285 (`querygraph/grust` main; recorded in `GRUST_COMMIT`) |
+| nutmeg commit | 0480123994b67f32dc41c01d58aa914c8877fd3e (`integration/nutmeg-0.1`, the integrated head; these results are committed on top of it) |
+| sail commit | f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f (upstream `lakehq/sail` main, which contains the session-factory hook from #2630; recorded in `SAIL_COMMIT`) |
 | pyspark (client) | 4.2.0 (`pyspark-client`) |
 | server Spark version (spark.version) | 4.2.0 |
 | python (client) | 3.13.5 |
