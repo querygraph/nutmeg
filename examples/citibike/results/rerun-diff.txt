@@ -1,0 +1,13 @@
+# diff between two consecutive runs of the same script (run 10 -> run 11, the captured run)
+65c65
+< | 55 | 1 | 9.69951240834e-09 | 774 | 1 |
+---
+> | 55 | 1 | 9.6995114111e-09 | 774 | 1 |
+121c121
+< - Nutmeg, tolerance 1e-13 (114 iterations, converged True) vs NumPy reference: 774 nodes; max |diff| = 8.345e-14, L1 diff = 4.357e-13, max relative diff = 6.045e-11; top 10 same order: True; top 50 same order: True (same set: True)
+---
+> - Nutmeg, tolerance 1e-13 (114 iterations, converged True) vs NumPy reference: 774 nodes; max |diff| = 8.345e-14, L1 diff = 4.371e-13, max relative diff = 6.046e-11; top 10 same order: True; top 50 same order: True (same set: True)
+277c277
+< - NetworkX 3.7: max |diff| = 1.819e-12 over 761 nodes (largest score 28906.2); top 10 same order: True
+---
+> - NetworkX 3.7: max |diff| = 3.638e-12 over 761 nodes (largest score 28906.2); top 10 same order: True
