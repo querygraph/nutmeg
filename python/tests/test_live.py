@@ -133,25 +133,25 @@ def _cpu_seconds(pid):
 # every node and arc: at least N * 3N = 1.2e11 visits for N = 200,000. That is
 # over ten seconds even at an impossible 1e10 visits a second, while the
 # interrupt is sent within a second or two of the kernel's first work charge,
-# so the victim cannot finish before it is interrupted on any machine. The
-# sibling samples SIBLING_SOURCES sources, a fortieth of the work, so it is
-# still running when the victim has stopped, and it finishes.
+# so the victim cannot finish before it is interrupted on any machine.
+#
+# The sibling reads all pairs shortest paths on the same graph and cached
+# projection, and its consumer stops after SIBLING_ROWS rows until the victim
+# has been dealt with. Its result has N * N = 4e10 rows, so, held back by the
+# bounded channel and the transport, it is still running then on any machine.
+# Its memoryLimitBytes stops it at once if the read is ever materialised.
 VICTIM_NODES = 200_000
-SIBLING_SOURCES = 5_000
+SIBLING_ROWS = 100_000
 
 
 def test_an_interrupt_stops_the_kernel(nm):
     spark = nm.spark
     name = "interrupted"
     g = _ring(nm, name, VICTIM_NODES)
-    sibling_options = {"samplingSize": SIBLING_SOURCES, "seed": 7}
-
-    def sibling_rows():
-        return sorted(tuple(r) for r in nm.betweenness.stream(g, **sibling_options).collect())
-
-    lone = sibling_rows()
     known = {r["readId"] for r in _reads(spark, name)}
     outcome = {}
+    sibling_ready, sibling_go_on = threading.Event(), threading.Event()
+    sibling_read_all, sibling_release = threading.Event(), threading.Event()
 
     def victim():
         spark.addTag("nutmeg-victim")
@@ -163,46 +163,81 @@ def test_an_interrupt_stops_the_kernel(nm):
             spark.clearTags()
 
     def sibling():
-        outcome["sibling"] = sibling_rows()
+        spark.addTag("nutmeg-sibling")
+        try:
+            rows = nm.allPairsShortestPaths.stream(
+                g, memoryLimitBytes=256 << 20).toLocalIterator()
+            got = [tuple(next(rows)) for _ in range(SIBLING_ROWS)]
+            sibling_ready.set()
+            sibling_go_on.wait(120)
+            got += [tuple(next(rows)) for _ in range(SIBLING_ROWS)]
+            outcome["sibling"] = got
+            # Hold the unfinished result open until it has been interrupted.
+            sibling_read_all.set()
+            sibling_release.wait(120)
+        except Exception as error:
+            outcome["sibling error"] = error
+        finally:
+            sibling_ready.set()
+            sibling_read_all.set()
+            spark.clearTags()
+
+    def fresh(algorithm):
+        return [r for r in _reads(spark, name)
+                if r["readId"] not in known and r["algorithm"] == algorithm]
+
+    def read(read_id):
+        return [r for r in _reads(spark, name) if r["readId"] == read_id][0]
 
     victim_thread = threading.Thread(target=victim, daemon=True)
     victim_thread.start()
-
-    def fresh_running():
-        return [r for r in _reads(spark, name)
-                if r["readId"] not in known and r["state"] == "running" and r["workUnits"] > 0]
-
-    victim_id = _wait_until("the victim's kernel is charging work", fresh_running)[0]["readId"]
-    known.add(victim_id)
+    victim_id = _wait_until(
+        "the victim's kernel is charging work",
+        lambda: [r for r in fresh("betweenness")
+                 if r["state"] == "running" and r["workUnits"] > 0])[0]["readId"]
     sibling_thread = threading.Thread(target=sibling, daemon=True)
     sibling_thread.start()
-    sibling_id = _wait_until("the sibling's kernel is charging work", fresh_running)[0]["readId"]
+    sibling_ready.wait(60)
 
+    before = read(victim_id)
+    sent = time.monotonic()
     interrupted = spark.interruptTag("nutmeg-victim")
-
-    def ended(read_id):
-        rows = [r for r in _reads(spark, name) if r["readId"] == read_id]
-        return rows and rows[0]["state"] != "running" and rows[0]
-
     # The server's own record: the victim's kernel returned, cancelled, far
-    # short of its work, and holds nothing; the sibling is still running.
-    read = _wait_until("the interrupted kernel has stopped", lambda: ended(victim_id), timeout=10)
-    sibling_now = [r for r in _reads(spark, name) if r["readId"] == sibling_id][0]
-    assert read["state"] == "cancelled", read
-    assert "cancelled" in (read["message"] or ""), read
-    assert read["rows"] == 0 and read["liveBytes"] == 0, read
-    assert read["workUnits"] < VICTIM_NODES * 3 * VICTIM_NODES, read
-    assert sibling_now["state"] == "running", ("the sibling ended before the victim", sibling_now)
+    # short of its work, and holds nothing.
+    stopped = _wait_until("the interrupted kernel has stopped",
+                          lambda: read(victim_id)["state"] != "running" and read(victim_id),
+                          timeout=10)
+    print(f"victim: {before['workUnits']} work units when interrupted; stopped within "
+          f"{time.monotonic() - sent:.2f} s at {stopped['workUnits']} units, of at least "
+          f"{VICTIM_NODES * 3 * VICTIM_NODES}; {stopped['message']!r}")
+    assert stopped["state"] == "cancelled", stopped
+    assert "cancelled" in (stopped["message"] or ""), stopped
+    assert stopped["rows"] == 0 and stopped["liveBytes"] == 0, stopped
+    assert stopped["workUnits"] < VICTIM_NODES * 3 * VICTIM_NODES, stopped
     assert len(interrupted) == 1, interrupted
-
     victim_thread.join(timeout=30)
     assert not victim_thread.is_alive()
     assert "error" in outcome and "rows" not in outcome, outcome
 
-    sibling_thread.join(timeout=300)
-    assert not sibling_thread.is_alive()
+    # The sibling, on the same graph, was running throughout and goes on.
+    assert "sibling error" not in outcome, outcome
+    [sibling_read] = fresh("allPairsShortestPaths")
+    assert sibling_read["state"] == "running", sibling_read
+    sibling_go_on.set()
+    sibling_read_all.wait(120)
+    assert "sibling error" not in outcome, outcome
+    lone = [tuple(r) for r in nm.allPairsShortestPaths.stream(g).limit(2 * SIBLING_ROWS).collect()]
     assert outcome["sibling"] == lone
-    assert ended(sibling_id)["state"] == "finished"
+    # Interrupting the sibling, blocked on its consumer, stops it too.
+    assert read(sibling_read["readId"])["state"] == "running"
+    assert len(spark.interruptTag("nutmeg-sibling")) == 1
+    ended = _wait_until("the sibling has stopped",
+                        lambda: read(sibling_read["readId"])["state"] != "running"
+                        and read(sibling_read["readId"]), timeout=10)
+    assert ended["state"] == "cancelled", ended
+    sibling_release.set()
+    sibling_thread.join(timeout=30)
+    assert not sibling_thread.is_alive()
 
     pid = os.environ.get("NUTMEG_SERVER_PID")
     if pid:
@@ -210,7 +245,7 @@ def test_an_interrupt_stops_the_kernel(nm):
         before = _cpu_seconds(pid)
         time.sleep(2.0)
         busy = _cpu_seconds(pid) - before
-        print(f"server CPU over 2 s after both reads ended: {busy:.2f} s")
+        print(f"server CPU over 2 s after every read ended: {busy:.2f} s")
         assert busy < 0.5, f"the server used {busy:.2f} s of CPU in 2 s"
     g.drop()
 
