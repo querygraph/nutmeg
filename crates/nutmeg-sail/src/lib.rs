@@ -39,7 +39,10 @@ use datafusion_common::{Result, not_impl_err, plan_err};
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableSource, TableType};
 use futures::TryStreamExt;
-use nutmeg_graph::{AlgorithmTable, ColumnMapping, GraphsTable, Part, Registry, StageOrder};
+use nutmeg_graph::{
+    AlgorithmTable, ColumnMapping, GraphsTable, Part, ReadExecution, Registry, StageOrder,
+};
+use sail_common::config::ExecutionMode;
 use sail_common_datafusion::datasource::{
     DataSource, DataSourceRegistry, OptionLayer, SinkInfo, SinkMode, SourceInfo,
 };
@@ -284,16 +287,48 @@ impl DataSink for StageWriter {
 }
 
 /// Installs Nutmeg in every Sail session: the data source into the session's
-/// registry, the table functions into the session state. Wraps the mutator
-/// Sail would otherwise use so nothing of Sail's own setup changes.
+/// registry, the table functions into the session state, and the session's
+/// [`ReadExecution`]. Wraps the mutator Sail would otherwise use so nothing of
+/// Sail's own setup changes.
 pub struct NutmegSessionMutator {
     inner: Box<dyn ServerSessionMutator>,
+    reads: ReadExecution,
 }
 
 impl NutmegSessionMutator {
-    pub fn wrap(inner: Box<dyn ServerSessionMutator>) -> Box<dyn ServerSessionMutator> {
-        Box::new(Self { inner })
+    /// Nutmeg in every session of a server in `mode`, with reads executed as
+    /// [`read_execution`] chooses for it.
+    pub fn wrap(
+        inner: Box<dyn ServerSessionMutator>,
+        mode: &ExecutionMode,
+    ) -> Result<Box<dyn ServerSessionMutator>> {
+        Ok(Box::new(Self {
+            inner,
+            reads: read_execution(mode)?,
+        }))
     }
+}
+
+/// How reads run in a server in `mode`: as `NUTMEG_READS` says if it is set,
+/// otherwise streaming in local mode and materialised in either cluster mode.
+///
+/// In a cluster mode Sail's driver encodes every stage's physical plan to
+/// send it to a worker (`JobScheduler`, via `encode_remote_physical_plan`),
+/// and its codec (`RemoteExecutionCodec::try_encode`) refuses any node it does
+/// not know with `unsupported physical plan node`, which a streaming read's
+/// `NutmegAlgorithmExec` is. A materialised read plans an in-memory table,
+/// which it can encode. Note that staging does not work in a cluster mode
+/// either: the codec refuses the `DataSinkExec` of Nutmeg's writer (as
+/// `unsupported data sink node`), and a worker would not hold the driver's
+/// graphs if it did not. Nutmeg is a local-mode extension today.
+pub fn read_execution(mode: &ExecutionMode) -> Result<ReadExecution> {
+    if let Some(chosen) = ReadExecution::from_env()? {
+        return Ok(chosen);
+    }
+    Ok(match mode {
+        ExecutionMode::Local => ReadExecution::Streaming,
+        _ => ReadExecution::Materialized,
+    })
 }
 
 impl ServerSessionMutator for NutmegSessionMutator {
@@ -311,7 +346,7 @@ impl ServerSessionMutator for NutmegSessionMutator {
                 )
             })?;
         registry.register_data_source(Arc::new(NutmegDataSource))?;
-        Ok(config)
+        Ok(config.with_extension(Arc::new(self.reads)))
     }
 
     fn mutate_state(

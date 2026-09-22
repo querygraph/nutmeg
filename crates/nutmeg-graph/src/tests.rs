@@ -1,5 +1,6 @@
 use super::*;
 use arrow::array::{Float64Array, Int32Array};
+use futures::{StreamExt, TryStreamExt};
 use std::collections::BTreeSet;
 
 fn edges(source: &[&str], target: &[&str], weight: Option<&[f64]>) -> RecordBatch {
@@ -2580,4 +2581,247 @@ fn read_limits_are_read_options() {
     let open = AlgorithmTable::new("pagerank", name.into(), &no_options()).unwrap();
     assert_eq!(open.batches().unwrap()[0].num_rows(), 3);
     assert!(Registry::drop(name).unwrap());
+}
+
+/// The reads of `graph` in [`Registry::reads`].
+fn reads_of(graph: &str) -> Vec<ReadInfo> {
+    Registry::reads()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.graph == graph)
+        .collect()
+}
+
+/// Wait, polling, until `done` holds; fail after a minute.
+async fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// A ring of `n` nodes with a chord out of each: every node reaches every
+/// other, so a traversal from any source visits all `n` nodes and `2n` arcs.
+fn stage_ring(name: &str, n: usize) {
+    let id = |i: usize| format!("n{i:06}");
+    let (mut source, mut target) = (Vec::with_capacity(2 * n), Vec::with_capacity(2 * n));
+    for i in 0..n {
+        source.push(id(i));
+        target.push(id((i + 1) % n));
+        source.push(id(i));
+        target.push(id((i * 7_919 + 13) % n));
+    }
+    let source: Vec<&str> = source.iter().map(String::as_str).collect();
+    let target: Vec<&str> = target.iter().map(String::as_str).collect();
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[edges(&source, &target, None)],
+        &ColumnMapping::default(),
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
+}
+
+/// Planning a read, and explaining it, run no kernel: the plan is a
+/// `NutmegAlgorithmExec`, and neither `execute` nor anything before the
+/// stream's first poll starts the read. Polling it runs it once.
+#[tokio::test]
+async fn planning_and_explaining_a_read_run_no_kernel() -> Result<()> {
+    let name = "explained";
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[edges(&["a", "b", "c"], &["b", "c", "a"], None)],
+        &ColumnMapping::default(),
+        true,
+        StageOrder::Canonical,
+    )?;
+    let ctx = SessionContext::new();
+    register(&ctx);
+    let sql = format!("SELECT * FROM nutmeg_pagerank('{name}')");
+    let explained = ctx.sql(&format!("EXPLAIN {sql}")).await?.collect().await?;
+    let mut text = String::new();
+    for batch in &explained {
+        for column in batch.columns() {
+            for line in column.as_string::<i32>().iter().flatten() {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+    }
+    assert!(
+        text.contains("NutmegAlgorithmExec: algorithm=pagerank, graph=explained"),
+        "{text}"
+    );
+    assert!(reads_of(name).is_empty(), "EXPLAIN ran a read");
+    let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+    assert!(reads_of(name).is_empty(), "planning ran a read");
+    let stream = plan.execute(0, ctx.task_ctx())?;
+    assert!(
+        reads_of(name).is_empty(),
+        "execute() ran a read before it was polled"
+    );
+    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    let reads = reads_of(name);
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert_eq!(reads[0].state, ReadState::Finished, "{reads:?}");
+    assert_eq!(reads[0].rows, 3);
+    // The same read materialised runs while it is planned, as it always did.
+    let materialized = SessionContext::new_with_config(
+        datafusion::prelude::SessionConfig::new()
+            .with_extension(Arc::new(ReadExecution::Materialized)),
+    );
+    register(&materialized);
+    materialized.sql(&sql).await?.create_physical_plan().await?;
+    assert_eq!(
+        reads_of(name).len(),
+        2,
+        "a materialised read runs at planning"
+    );
+    assert!(Registry::drop(name)?);
+    Ok(())
+}
+
+/// Dropping a read's stream while its kernel runs cancels the read: the
+/// kernel stops at its next check with `cancelled`, well short of its work,
+/// and the thread returns, releasing everything the read held.
+///
+/// The kernel is exact betweenness on a ring of 50,000 nodes and 100,000
+/// arcs: one traversal per source, each visiting every node and arc, so at
+/// least 50,000 x 150,000 = 7.5e9 visits before it can finish. That is over
+/// 0.7 s even at an impossible 1e10 visits a second, and the stream is dropped
+/// within milliseconds of the kernel's first charge. A kernel the drop did
+/// not reach would finish, and its message would then name the consumer
+/// rather than the cancellation.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_a_read_stream_cancels_its_kernel() -> Result<()> {
+    const N: usize = 50_000;
+    let name = "dropped-stream";
+    stage_ring(name, N);
+    let table = AlgorithmTable::new("betweenness", name.into(), &no_options())?;
+    let exec = AlgorithmExec::try_new(Arc::new(table), None, None)?;
+    let mut stream = exec.execute(0, SessionContext::new().task_ctx())?;
+    // The first poll starts the read; betweenness has nothing to send yet.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), stream.next())
+            .await
+            .is_err()
+    );
+    wait_until("the kernel is charging work", || {
+        reads_of(name)
+            .first()
+            .is_some_and(|r| r.state == ReadState::Running && r.work_units > 0)
+    })
+    .await;
+    drop(stream);
+    wait_until("the read has ended", || {
+        reads_of(name)
+            .first()
+            .is_some_and(|r| r.state != ReadState::Running)
+    })
+    .await;
+    let read = reads_of(name).remove(0);
+    assert_eq!(read.state, ReadState::Cancelled, "{read:?}");
+    let message = read.message.clone().unwrap_or_default();
+    assert!(message.contains("cancelled"), "{read:?}");
+    assert_eq!(read.rows, 0, "{read:?}");
+    assert!(read.work_units < N * 3 * N, "{read:?}");
+    assert_eq!(
+        read.live_bytes, 0,
+        "the read released what it held: {read:?}"
+    );
+    assert!(Registry::drop(name)?);
+    Ok(())
+}
+
+/// A streaming read hands its first batches on while the kernel is still
+/// producing the rest, and a consumer reading slowly holds it to a few
+/// batches: the read's peak is a small fraction of the whole result, which a
+/// materialised read holds at once. Both return the same rows in the same
+/// order. `allPairsShortestPaths` computes each batch when it is pulled.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_consumer_holds_a_streaming_read_to_a_few_batches() -> Result<()> {
+    const N: usize = 1_500;
+    let name = "streamed-pairs";
+    stage_ring(name, N);
+    let table = Arc::new(AlgorithmTable::new(
+        "allPairsShortestPaths",
+        name.into(),
+        &no_options(),
+    )?);
+    let whole = table.batches()?;
+    assert_eq!(whole.iter().map(|b| b.num_rows()).sum::<usize>(), N * N);
+    let materialized = reads_of(name).remove(0);
+    assert_eq!(materialized.state, ReadState::Finished);
+
+    let exec = AlgorithmExec::try_new(table.clone(), None, None)?;
+    let mut stream = exec.execute(0, SessionContext::new().task_ctx())?;
+    // Each batch is compared with the materialised one and dropped, as a
+    // consumer sending rows on would.
+    let mut received = 0;
+    let check = |received: &mut usize, batch: RecordBatch| {
+        assert_eq!(batch, whole[*received], "batch {received}");
+        *received += 1;
+    };
+    check(&mut received, stream.next().await.expect("a first batch")?);
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let read = reads_of(name).remove(1);
+        assert_eq!(read.state, ReadState::Running, "{read:?}");
+        assert!(
+            read.batches <= received + READ_CHANNEL_BATCHES + 1,
+            "the kernel ran ahead of a slow consumer: {read:?}"
+        );
+        check(&mut received, stream.next().await.expect("more batches")?);
+    }
+    while let Some(batch) = stream.next().await {
+        check(&mut received, batch?);
+    }
+    assert_eq!(received, whole.len());
+    let read = reads_of(name).remove(1);
+    assert_eq!(read.state, ReadState::Finished, "{read:?}");
+    assert_eq!(read.rows, N * N);
+    eprintln!(
+        "all pairs on {N} nodes: materialised peak {} bytes, streamed peak {} bytes",
+        materialized.peak_bytes, read.peak_bytes
+    );
+    assert!(
+        read.peak_bytes * 20 < materialized.peak_bytes,
+        "streamed {read:?}, materialised {materialized:?}"
+    );
+    drop(whole);
+    assert!(Registry::drop(name)?);
+    Ok(())
+}
+
+/// A `LIMIT` ends the stream once it has its rows, and stops the read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_limit_stops_the_read_once_it_has_its_rows() -> Result<()> {
+    let name = "limited-stream";
+    stage_ring(name, 1_000);
+    let ctx = SessionContext::new();
+    register(&ctx);
+    let batches = ctx
+        .sql(&format!(
+            "SELECT * FROM nutmeg_all_pairs_shortest_paths('{name}') LIMIT 10"
+        ))
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 10);
+    wait_until("the limited read has ended", || {
+        reads_of(name)
+            .first()
+            .is_some_and(|r| r.state != ReadState::Running)
+    })
+    .await;
+    let read = reads_of(name).remove(0);
+    assert_eq!(read.state, ReadState::Cancelled, "{read:?}");
+    assert!(read.rows < 1_000 * 1_000, "{read:?}");
+    assert!(Registry::drop(name)?);
+    Ok(())
 }

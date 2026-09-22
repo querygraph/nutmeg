@@ -1,5 +1,7 @@
 """Live test against a running nutmeg-server: NUTMEG_REMOTE=sc://127.0.0.1:50051 pytest."""
 import os
+import threading
+import time
 
 import pytest
 
@@ -79,4 +81,190 @@ def test_nullable_outputs_hold_nulls(nm):
         assert frame.schema["distance"].nullable, algorithm
         dist = {r["nodeId"]: r["distance"] for r in frame.collect()}
         assert dist["d"] is None and dist["a"] == 0.0, (algorithm, dist)
+    g.drop()
+
+
+# Streaming reads. A read's kernel runs when the query executes, on a thread of
+# its own feeding a bounded channel, and dropping the execution's stream (which
+# is what Sail's interrupt does) cancels it. `nutmeg_reads()` shows each read's
+# state as the server sees it, so these tests observe the kernel, not only the
+# client. Set NUTMEG_SERVER_PID to the server's process id to also check that
+# its CPU goes idle once an interrupted kernel has stopped.
+
+
+def _reads(spark, graph):
+    return [r.asDict() for r in spark.sql("SELECT * FROM nutmeg_reads()").collect()
+            if r["graph"] == graph]
+
+
+def _wait_until(what, predicate, timeout=60.0, interval=0.05):
+    deadline = time.monotonic() + timeout
+    while True:
+        value = predicate()
+        if value:
+            return value
+        assert time.monotonic() < deadline, f"timed out waiting until {what}"
+        time.sleep(interval)
+
+
+def _ring(nm, name, n):
+    """A ring of n nodes with one chord out of each: every node reaches every
+    other, so any traversal visits all n nodes and 2n arcs."""
+    from pyspark.sql import functions as F
+
+    def node(column):
+        return F.concat(F.lit("n"), F.lpad(column.cast("string"), 6, "0"))
+
+    ids = nm.spark.range(n)
+    edges = ids.select(node(F.col("id")).alias("src"),
+                       node((F.col("id") + 1) % n).alias("dst")).union(
+        ids.select(node(F.col("id")).alias("src"),
+                   node((F.col("id") * 7919 + 13) % n).alias("dst")))
+    return nm.graph.project(name, edges, source="src", target="dst")
+
+
+def _cpu_seconds(pid):
+    with open(f"/proc/{pid}/stat") as f:
+        fields = f.read().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
+# Exact betweenness on the ring runs one traversal per node, each visiting
+# every node and arc: at least N * 3N = 1.2e11 visits for N = 200,000. That is
+# over ten seconds even at an impossible 1e10 visits a second, while the
+# interrupt is sent within a second or two of the kernel's first work charge,
+# so the victim cannot finish before it is interrupted on any machine. The
+# sibling samples SIBLING_SOURCES sources, a fortieth of the work, so it is
+# still running when the victim has stopped, and it finishes.
+VICTIM_NODES = 200_000
+SIBLING_SOURCES = 5_000
+
+
+def test_an_interrupt_stops_the_kernel(nm):
+    spark = nm.spark
+    name = "interrupted"
+    g = _ring(nm, name, VICTIM_NODES)
+    sibling_options = {"samplingSize": SIBLING_SOURCES, "seed": 7}
+
+    def sibling_rows():
+        return sorted(tuple(r) for r in nm.betweenness.stream(g, **sibling_options).collect())
+
+    lone = sibling_rows()
+    known = {r["readId"] for r in _reads(spark, name)}
+    outcome = {}
+
+    def victim():
+        spark.addTag("nutmeg-victim")
+        try:
+            outcome["rows"] = nm.betweenness.stream(g).collect()
+        except Exception as error:  # the interrupt surfaces here
+            outcome["error"] = error
+        finally:
+            spark.clearTags()
+
+    def sibling():
+        outcome["sibling"] = sibling_rows()
+
+    victim_thread = threading.Thread(target=victim, daemon=True)
+    victim_thread.start()
+
+    def fresh_running():
+        return [r for r in _reads(spark, name)
+                if r["readId"] not in known and r["state"] == "running" and r["workUnits"] > 0]
+
+    victim_id = _wait_until("the victim's kernel is charging work", fresh_running)[0]["readId"]
+    known.add(victim_id)
+    sibling_thread = threading.Thread(target=sibling, daemon=True)
+    sibling_thread.start()
+    sibling_id = _wait_until("the sibling's kernel is charging work", fresh_running)[0]["readId"]
+
+    interrupted = spark.interruptTag("nutmeg-victim")
+
+    def ended(read_id):
+        rows = [r for r in _reads(spark, name) if r["readId"] == read_id]
+        return rows and rows[0]["state"] != "running" and rows[0]
+
+    # The server's own record: the victim's kernel returned, cancelled, far
+    # short of its work, and holds nothing; the sibling is still running.
+    read = _wait_until("the interrupted kernel has stopped", lambda: ended(victim_id), timeout=10)
+    sibling_now = [r for r in _reads(spark, name) if r["readId"] == sibling_id][0]
+    assert read["state"] == "cancelled", read
+    assert "cancelled" in (read["message"] or ""), read
+    assert read["rows"] == 0 and read["liveBytes"] == 0, read
+    assert read["workUnits"] < VICTIM_NODES * 3 * VICTIM_NODES, read
+    assert sibling_now["state"] == "running", ("the sibling ended before the victim", sibling_now)
+    assert len(interrupted) == 1, interrupted
+
+    victim_thread.join(timeout=30)
+    assert not victim_thread.is_alive()
+    assert "error" in outcome and "rows" not in outcome, outcome
+
+    sibling_thread.join(timeout=300)
+    assert not sibling_thread.is_alive()
+    assert outcome["sibling"] == lone
+    assert ended(sibling_id)["state"] == "finished"
+
+    pid = os.environ.get("NUTMEG_SERVER_PID")
+    if pid:
+        # Nothing is left running: the server's CPU is idle.
+        before = _cpu_seconds(pid)
+        time.sleep(2.0)
+        busy = _cpu_seconds(pid) - before
+        print(f"server CPU over 2 s after both reads ended: {busy:.2f} s")
+        assert busy < 0.5, f"the server used {busy:.2f} s of CPU in 2 s"
+    g.drop()
+
+
+def test_a_large_read_streams_under_a_slow_consumer(nm):
+    # All pairs on n nodes is n * n rows, 4,000,000 here, and each row holds at
+    # least two string offsets and a double: over 64 MB. Its cursor computes a
+    # batch when one is pulled.
+    spark = nm.spark
+    name = "streamed"
+    n = 2_000
+    at_least = n * n * 16
+    g = _ring(nm, name, n)
+    known = {r["readId"] for r in _reads(spark, name)}
+
+    def this_read():
+        [read] = [r for r in _reads(spark, name) if r["readId"] not in known]
+        return read
+
+    started = time.monotonic()
+    rows = nm.allPairsShortestPaths.stream(g).toLocalIterator()
+    next(rows)
+    first = time.monotonic() - started
+    # The consumer pauses. Once the batches in flight have filled the
+    # transport's buffers the kernel waits for it: the read is still running,
+    # has stopped producing, and holds a few batches, not its result.
+    time.sleep(1.5)
+    paused = this_read()
+    time.sleep(1.0)
+    later = this_read()
+    assert paused["state"] == later["state"] == "running", (paused, later)
+    assert paused["rows"] == later["rows"] < n * n // 2, (paused, later)
+    assert later["liveBytes"] * 10 < at_least, later
+    count = 1 + sum(1 for _ in rows)
+    total = time.monotonic() - started
+    assert count == n * n
+    read = this_read()
+    assert read["state"] == "finished" and read["rows"] == n * n, read
+    assert read["peakBytes"] * 10 < at_least, read
+    print(f"all pairs on {n} nodes: first row after {first:.2f} s of {total:.2f} s; "
+          f"{paused['rows']} rows produced while the consumer paused; "
+          f"live {later['liveBytes']} bytes then; read peak {read['peakBytes']} bytes")
+    g.drop()
+
+
+def test_explain_runs_no_kernel(nm, capsys):
+    spark = nm.spark
+    name = "explained"
+    g = _ring(nm, name, 1_000)
+    known = {r["readId"] for r in _reads(spark, name)}
+    plan = spark.sql(
+        f"EXPLAIN SELECT * FROM nutmeg_betweenness('{name}')").collect()[0][0]
+    nm.betweenness.stream(g).explain(True)
+    assert [r for r in _reads(spark, name) if r["readId"] not in known] == []
+    assert "NutmegAlgorithmExec" in plan, plan
+    assert "NutmegAlgorithmExec" in capsys.readouterr().out
     g.drop()

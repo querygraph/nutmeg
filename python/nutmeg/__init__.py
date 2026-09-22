@@ -185,6 +185,15 @@ class Nutmeg:
                 reader = reader.option(key, _text(value))
         return reader.load()
 
+    def reads(self):
+        """The server's reads, running and recently ended, as a DataFrame:
+        `readId`, `algorithm`, `graph`, `state` (`running`, `finished`,
+        `cancelled` or `failed`), `message`, `batches`, `rows`, `liveBytes`,
+        `peakBytes` and `workUnits`. A read's kernel runs when its DataFrame
+        is executed, and an interrupt (`spark.interruptAll()`,
+        `interruptTag`, `interruptOperation`) cancels it."""
+        return self.spark.sql("SELECT * FROM nutmeg_reads()")
+
     def __getattr__(self, algorithm: str) -> _Algorithm:
         if algorithm.startswith("_"):
             raise AttributeError(algorithm)

@@ -200,13 +200,46 @@ comparable across kernels, and wall time depends on load. A default would
 fail large, legitimate reads on a busy machine and not on an idle one, and
 Spark sets no query timeout by default either.
 
-**Cancellation.** `Query::cancel` stops a read. Its kernel fails with
-`cancelled` at its next check. Sail's interrupt does not reach a read today.
-The kernel runs inside the table's `scan`, which DataFusion calls while it
-plans the query. That is before Sail creates the executor whose stream an
-interrupt drops, and the call is synchronous, so dropping its future cannot
-stop it. Sail's interrupt could reach it if the kernel ran in the scan's
-execution stream and dropping the stream cancelled its read.
+**Cancellation.** A read's kernel runs when its query executes, not while
+it is planned. The scan plans a `NutmegAlgorithmExec`, one partition, and
+nothing runs until its stream is first polled. Then the read's child
+execution is created (so `timeoutMs` counts from there) and the kernel starts
+on a thread of its own, not on the async runtime's. It sends each batch
+through a channel of two batches, and waits when the channel is full, so a
+slow consumer holds a read to a few batches: all-pairs shortest paths, whose
+cursor computes each batch when it is pulled, then holds its workspace and
+those batches rather than its whole result. Dropping the stream before its
+end cancels the read, and the kernel stops at its next check with
+`cancelled`, or at its next send, which finds the channel closed. Sail's
+interrupt (`spark.interruptAll()`, `interruptTag`, `interruptOperation`)
+drops the stream, so it stops the kernel. A `LIMIT` that has its rows ends
+the stream and stops the read the same way. `Query::cancel` stops a read
+from Rust. A projection being built when a read is cancelled is finished and
+cached, as it belongs to the budget.
+
+`EXPLAIN` plans without executing, so it runs no kernel. The schema a read
+reports is still found once per algorithm, by running it on a three-node
+probe graph at planning.
+
+`SELECT * FROM nutmeg_reads()` (or `Nutmeg.reads()` from Python) lists the
+reads running now and the last 256 that ended: `readId`, `algorithm`,
+`graph`, `state` (`running`, `finished`, `cancelled`, `failed`), `message`,
+`batches`, `rows`, and the read's own `liveBytes`, `peakBytes` and
+`workUnits`. A read leaves `running` only when its thread has returned from
+the kernel.
+
+**Materialised reads.** `NUTMEG_READS=materialized` runs every read the old
+way: inside the scan, while the query is planned, collected into an
+in-memory table before its first row leaves. No interrupt reaches it.
+`nutmeg-server` selects it in Sail's cluster modes (`local-cluster`,
+`kubernetes-cluster`) unless `NUTMEG_READS` says otherwise, because there
+Sail's driver encodes each stage's plan for a worker and its codec refuses a
+node it does not know, `NutmegAlgorithmExec` included, while it can encode
+an in-memory table. Staging does not work in a cluster mode either: the
+codec refuses the stage writer's `DataSinkExec` too. Even if it did not, a
+Kubernetes worker is a process of its own and would not hold the driver's
+graphs (local-cluster workers are actors in the server's process). Nutmeg is
+a local-mode extension today.
 
 ## Sail
 

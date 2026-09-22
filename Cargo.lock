@@ -5591,6 +5591,7 @@ dependencies = [
  "datafusion-expr",
  "futures",
  "nutmeg-graph",
+ "sail-common",
  "sail-common-datafusion",
  "sail-session",
  "tokio",

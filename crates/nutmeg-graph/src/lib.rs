@@ -29,6 +29,13 @@
 //! context ([`Query`]): its memory counts against the one budget, and its
 //! cancellation, deadline and work budget ([`QueryLimits`]) are its own.
 //!
+//! A read's kernel runs when the query executes, not while it is planned: the
+//! scan plans an [`AlgorithmExec`], whose stream runs the kernel on a thread of
+//! its own and hands its batches on as they are made, through a bounded
+//! channel. Dropping the stream cancels the read, so an engine's interrupt
+//! stops the kernel. `nutmeg_reads()` lists reads and how they ended. See
+//! [`ReadExecution`] for the materialised alternative, and when it is used.
+//!
 //! This crate knows nothing about Sail or Spark: it registers into any
 //! DataFusion 55 `SessionContext`. `nutmeg-sail` adapts it to a Sail session.
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -48,9 +55,16 @@ use arrow::row::{RowConverter, Rows, SortField};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunction, TableFunctionImpl, TableProvider};
 use datafusion::datasource::MemTable;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::execution::TaskContext;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream,
+};
 use datafusion::prelude::SessionContext;
-use datafusion_common::{DataFusionError, Result, ScalarValue, exec_err, plan_err};
+use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::{DataFusionError, Result, ScalarValue, exec_err, internal_err, plan_err};
 use datafusion_expr::{Expr, TableType};
 use grust_algorithms::{
     ArrowResultCursor, CsrEstimate, GraphProjection, NodeProperties, ProjectionOptions,
@@ -1352,11 +1366,30 @@ impl Store {
         graph_name: &str,
         args: &ValidatedArguments,
     ) -> Result<Vec<RecordBatch>> {
+        let mut out = Vec::new();
+        self.run_each(query, algorithm, graph_name, args, &mut |batch| {
+            out.push(batch);
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// [`Store::run`], handing each batch to `emit` as the kernel's cursor
+    /// produces it instead of collecting them. `emit` returns `false` to stop
+    /// early: the cursor, and with it the kernel's working storage, is dropped
+    /// at once. Returns whether the result was read to its end.
+    fn run_each(
+        &self,
+        query: &Query,
+        algorithm: &str,
+        graph_name: &str,
+        args: &ValidatedArguments,
+        emit: &mut dyn FnMut(RecordBatch) -> Result<bool>,
+    ) -> Result<bool> {
         let definition = definition_of(algorithm)?;
-        self.run_kernel(query, algorithm, graph_name, args)?
-            .into_iter()
-            .map(|batch| conform(definition, batch))
-            .collect()
+        self.run_kernel(query, algorithm, graph_name, args, &mut |batch| {
+            emit(conform(definition, batch)?)
+        })
     }
 
     fn run_kernel(
@@ -1365,7 +1398,8 @@ impl Store {
         algorithm: &str,
         graph_name: &str,
         args: &ValidatedArguments,
-    ) -> Result<Vec<RecordBatch>> {
+        emit: &mut dyn FnMut(RecordBatch) -> Result<bool>,
+    ) -> Result<bool> {
         let context = &query.context;
         // A kernel's memory refusal says which budget refused it, as the
         // read's own admissions do.
@@ -1391,16 +1425,19 @@ impl Store {
             let weighted = matches!(options.weight, WeightSelection::Property { .. });
             let e = CsrEstimate::upper_bound(nodes, edges, options.orientation, weighted)
                 .map_err(err)?;
-            return int_row(
-                &output_names(algorithm)?,
-                &[
-                    nodes,
-                    edges,
-                    e.max_arcs,
-                    e.outgoing_bytes,
-                    e.reverse_bytes,
-                    e.positions_bytes,
-                ],
+            return emit_all(
+                int_row(
+                    &output_names(algorithm)?,
+                    &[
+                        nodes,
+                        edges,
+                        e.max_arcs,
+                        e.outgoing_bytes,
+                        e.reverse_bytes,
+                        e.positions_bytes,
+                    ],
+                )?,
+                emit,
             );
         }
         let cached = self.projection(graph_name, args)?;
@@ -1412,9 +1449,12 @@ impl Store {
         let cursor = match algorithm {
             "projectionStats" => {
                 let s = g.statistics().map_err(failed)?;
-                return int_row(
-                    &output_names(algorithm)?,
-                    &[s.nodes, s.edges, s.arcs, s.self_loops, s.csr_bytes],
+                return emit_all(
+                    int_row(
+                        &output_names(algorithm)?,
+                        &[s.nodes, s.edges, s.arcs, s.self_loops, s.csr_bytes],
+                    )?,
+                    emit,
                 );
             }
             // Every projection kernel Grust registers, by name: Grust finds the
@@ -1439,7 +1479,7 @@ impl Store {
                 }
             }
         };
-        drain(cursor, failed)
+        drain(cursor, failed, emit)
     }
 }
 
@@ -1645,6 +1685,18 @@ impl Registry {
         store().memory()
     }
 
+    /// Table reads ([`AlgorithmTable`]): the most recently ended ones, oldest
+    /// first, each with the usage it ended with, then those running now, with
+    /// their live usage. Reads by [`run`] and [`Query::run`] are not listed.
+    pub fn reads() -> Result<Vec<ReadInfo>> {
+        let log = READS.lock().map_err(|_| poisoned())?;
+        let running = log
+            .running
+            .values()
+            .map(|(info, query)| with_usage(info.clone(), query));
+        Ok(log.ended.iter().cloned().chain(running).collect())
+    }
+
     /// The node batches a projection of `name` is built from (see
     /// [`Store::node_batches`]), with derived nodes admitted on the pool.
     #[cfg(test)]
@@ -1780,6 +1832,155 @@ impl Query {
         args: &ValidatedArguments,
     ) -> Result<Vec<RecordBatch>> {
         store().run(self, algorithm, graph_name, args)
+    }
+
+    /// Whether [`Query::cancel`] has been called on this read (or on the
+    /// budget it belongs to).
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self.context.checkpoint(), Err(ProcedureError::Cancelled))
+    }
+}
+
+/// What a read is doing, or how it ended. See [`Registry::reads`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadState {
+    /// Its kernel is running, or its result is being read.
+    Running,
+    /// Its result was read to the end.
+    Finished,
+    /// It was cancelled, or its consumer stopped reading (a dropped stream,
+    /// a `LIMIT` reached), and its kernel has stopped.
+    Cancelled,
+    /// It failed, for a reason of its own: a limit, a refusal, an error.
+    Failed,
+}
+
+impl ReadState {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Finished => "finished",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One table read, running or recently ended, as [`Registry::reads`] and
+/// `nutmeg_reads()` report it. A read leaves `Running` only when the thread
+/// running its kernel has returned from it, so a read listed as ended has no
+/// kernel running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadInfo {
+    /// Numbered from 1 in the order reads started, in this process.
+    pub id: u64,
+    pub algorithm: &'static str,
+    pub graph: String,
+    pub state: ReadState,
+    /// Why it ended, if not by finishing.
+    pub message: Option<String>,
+    /// Batches and rows the read has handed on so far.
+    pub batches: usize,
+    pub rows: usize,
+    /// The read's own admitted bytes (part of the budget's): what it holds
+    /// now, and the most it has held at once. An ended read's live bytes are
+    /// those still held when it ended, by result batches not yet released
+    /// downstream.
+    pub live_bytes: usize,
+    pub peak_bytes: usize,
+    /// Grust work units the read has charged.
+    pub work_units: usize,
+}
+
+/// Ended reads kept for [`Registry::reads`], newest last.
+const ENDED_READS_KEPT: usize = 256;
+
+#[derive(Default)]
+struct ReadLog {
+    started: u64,
+    running: BTreeMap<u64, (ReadInfo, Query)>,
+    ended: std::collections::VecDeque<ReadInfo>,
+}
+
+static READS: Lazy<std::sync::Mutex<ReadLog>> = Lazy::new(Default::default);
+
+fn with_usage(mut info: ReadInfo, query: &Query) -> ReadInfo {
+    if let Ok(usage) = query.usage() {
+        info.live_bytes = usage.live_bytes;
+        info.peak_bytes = usage.peak_bytes;
+        info.work_units = usage.counted_work().unwrap_or(0);
+    }
+    info
+}
+
+/// A read's entry in the log while it runs. Ending it moves the entry to the
+/// ended reads; one dropped without ending (its thread panicked) ends as
+/// failed.
+struct ReadRecord {
+    id: u64,
+    ended: bool,
+}
+
+impl ReadRecord {
+    fn start(algorithm: &'static str, graph: &str, query: &Query) -> Result<Self> {
+        let mut log = READS.lock().map_err(|_| poisoned())?;
+        log.started += 1;
+        let id = log.started;
+        let info = ReadInfo {
+            id,
+            algorithm,
+            graph: graph.to_string(),
+            state: ReadState::Running,
+            message: None,
+            batches: 0,
+            rows: 0,
+            live_bytes: 0,
+            peak_bytes: 0,
+            work_units: 0,
+        };
+        log.running.insert(id, (info, query.clone()));
+        Ok(Self { id, ended: false })
+    }
+
+    fn batch(&self, rows: usize) {
+        if let Ok(mut log) = READS.lock()
+            && let Some((info, _)) = log.running.get_mut(&self.id)
+        {
+            info.batches += 1;
+            info.rows += rows;
+        }
+    }
+
+    fn end(mut self, state: ReadState, message: Option<String>) {
+        self.ended = true;
+        Self::end_id(self.id, state, message);
+    }
+
+    fn end_id(id: u64, state: ReadState, message: Option<String>) {
+        let Ok(mut log) = READS.lock() else {
+            return;
+        };
+        if let Some((info, query)) = log.running.remove(&id) {
+            let mut info = with_usage(info, &query);
+            info.state = state;
+            info.message = message;
+            log.ended.push_back(info);
+            while log.ended.len() > ENDED_READS_KEPT {
+                log.ended.pop_front();
+            }
+        }
+    }
+}
+
+impl Drop for ReadRecord {
+    fn drop(&mut self) {
+        if !self.ended {
+            Self::end_id(
+                self.id,
+                ReadState::Failed,
+                Some("the read's thread ended without an outcome".into()),
+            );
+        }
     }
 }
 
@@ -1960,15 +2161,32 @@ pub fn options_from_strings(
     Ok(out)
 }
 
+/// Pull the cursor a batch at a time into `emit`, until it ends or `emit`
+/// declines more. Each batch is computed when it is pulled for a cursor that
+/// streams (all-pairs shortest paths), so stopping early stops the kernel.
 fn drain(
     mut cursor: ArrowResultCursor,
     failed: impl Fn(ProcedureError) -> DataFusionError,
-) -> Result<Vec<RecordBatch>> {
-    let mut out = Vec::new();
+    emit: &mut dyn FnMut(RecordBatch) -> Result<bool>,
+) -> Result<bool> {
     while let Some(batch) = cursor.next_batch().map_err(&failed)? {
-        out.push(batch.record_batch().clone());
+        if !emit(batch.record_batch().clone())? {
+            return Ok(false);
+        }
     }
-    Ok(out)
+    Ok(true)
+}
+
+fn emit_all(
+    batches: Vec<RecordBatch>,
+    emit: &mut dyn FnMut(RecordBatch) -> Result<bool>,
+) -> Result<bool> {
+    for batch in batches {
+        if !emit(batch)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn int_row(names: &[&str], values: &[usize]) -> Result<Vec<RecordBatch>> {
@@ -2251,7 +2469,7 @@ pub fn output_schema(algorithm: &str) -> Result<SchemaRef> {
 }
 
 /// A table whose scan runs one algorithm on one named graph.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct AlgorithmTable {
     algorithm: &'static str,
     graph: String,
@@ -2317,25 +2535,458 @@ impl AlgorithmTable {
         self.batches_for(&self.query()?)
     }
 
-    /// Run the table's algorithm for `query`.
+    /// Run the table's algorithm for `query`, collecting its result.
     pub fn batches_for(&self, query: &Query) -> Result<Vec<RecordBatch>> {
-        let batches = query
-            .run(self.algorithm, &self.graph, &self.args)?
-            .into_iter()
-            .map(|batch| self.names.rename_batch(batch))
-            .collect::<Result<Vec<_>>>()?;
-        if let Some(bad) = batches
-            .iter()
-            .find(|b| b.schema().fields() != self.schema.fields())
-        {
-            return exec_err!(
-                "nutmeg: `{}` produced {:?}, declared {:?}",
-                self.algorithm,
-                bad.schema().fields(),
-                self.schema.fields()
-            );
+        let mut out = Vec::new();
+        self.read_each(query, &mut |batch| {
+            out.push(batch);
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// Run the table's algorithm for `query`, handing each batch, renamed and
+    /// checked against the table's schema, to `emit` as it is produced;
+    /// `emit` returns `false` to stop the read. The read is listed by
+    /// [`Registry::reads`] from start to end.
+    pub fn read_each(
+        &self,
+        query: &Query,
+        emit: &mut dyn FnMut(RecordBatch) -> Result<bool>,
+    ) -> Result<()> {
+        let record = ReadRecord::start(self.algorithm, &self.graph, query)?;
+        let outcome = store().run_each(
+            query,
+            self.algorithm,
+            &self.graph,
+            &self.args,
+            &mut |batch| {
+                let batch = self.names.rename_batch(batch)?;
+                if batch.schema().fields() != self.schema.fields() {
+                    return exec_err!(
+                        "nutmeg: `{}` produced {:?}, declared {:?}",
+                        self.algorithm,
+                        batch.schema().fields(),
+                        self.schema.fields()
+                    );
+                }
+                record.batch(batch.num_rows());
+                emit(batch)
+            },
+        );
+        match &outcome {
+            Ok(true) => record.end(ReadState::Finished, None),
+            Ok(false) => record.end(
+                ReadState::Cancelled,
+                Some("its consumer stopped reading".into()),
+            ),
+            Err(error) => {
+                let state = if query.is_cancelled() {
+                    ReadState::Cancelled
+                } else {
+                    ReadState::Failed
+                };
+                record.end(state, Some(error.to_string()));
+            }
         }
-        Ok(batches)
+        outcome.map(|_| ())
+    }
+}
+
+/// Where a read's kernel runs.
+///
+/// `Streaming` (the default) plans an [`AlgorithmExec`]: nothing runs while
+/// the query is planned or explained, and the kernel starts when the plan's
+/// stream is first polled, on a thread of its own, feeding batches through a
+/// bounded channel. Dropping the stream cancels the read, which is how an
+/// interrupt (Sail's `interruptAll`, `interruptTag`, `interruptOperation`)
+/// reaches the kernel.
+///
+/// `Materialized` runs the kernel inside `TableProvider::scan`, while the
+/// query is planned, and plans the collected result as an in-memory table.
+/// Nothing can interrupt it, and the whole result is held before its first
+/// row leaves. It exists for engines that ship physical plans to other
+/// processes, which can serialise an in-memory table but not an
+/// [`AlgorithmExec`]: `nutmeg-sail` selects it in Sail's cluster modes.
+///
+/// A session selects one with a [`SessionConfig`] extension
+/// (`config.with_extension(Arc::new(ReadExecution::Materialized))`);
+/// without one, the `NUTMEG_READS` environment variable (`streaming` or
+/// `materialized`) does, and otherwise reads stream.
+///
+/// [`SessionConfig`]: datafusion::prelude::SessionConfig
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadExecution {
+    #[default]
+    Streaming,
+    Materialized,
+}
+
+/// The environment variable that selects [`ReadExecution`] when a session
+/// does not.
+pub const READS_VARIABLE: &str = "NUTMEG_READS";
+
+impl ReadExecution {
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "streaming" => Ok(Self::Streaming),
+            "materialized" | "materialised" => Ok(Self::Materialized),
+            other => plan_err!(
+                "nutmeg: {READS_VARIABLE} is `streaming` or `materialized`, got `{other}`"
+            ),
+        }
+    }
+
+    /// The choice `NUTMEG_READS` makes, if it is set.
+    pub fn from_env() -> Result<Option<Self>> {
+        match std::env::var(READS_VARIABLE) {
+            Ok(text) => Self::parse(&text).map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// The session's choice, else the environment's, else streaming.
+    pub fn for_session(state: &dyn Session) -> Result<Self> {
+        if let Some(chosen) = state.config().get_extension::<Self>() {
+            return Ok(*chosen);
+        }
+        Ok(Self::from_env()?.unwrap_or_default())
+    }
+}
+
+/// Batches a running read may have produced and not yet handed on: the
+/// kernel's thread blocks once this many wait in the channel, so a slow
+/// consumer holds the read to this many batches beyond the one it is
+/// reading and the one the kernel is making.
+pub const READ_CHANNEL_BATCHES: usize = 2;
+
+/// The physical plan of a streaming read (see [`ReadExecution`]): one
+/// partition, whose stream starts the table's read when first polled and
+/// cancels it when dropped.
+#[derive(Debug)]
+pub struct AlgorithmExec {
+    table: Arc<AlgorithmTable>,
+    projection: Option<Vec<usize>>,
+    limit: Option<usize>,
+    schema: SchemaRef,
+    properties: Arc<PlanProperties>,
+}
+
+impl AlgorithmExec {
+    pub fn try_new(
+        table: Arc<AlgorithmTable>,
+        projection: Option<Vec<usize>>,
+        limit: Option<usize>,
+    ) -> Result<Self> {
+        let schema = match &projection {
+            Some(columns) => Arc::new(table.schema.project(columns)?),
+            None => table.schema.clone(),
+        };
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Ok(Self {
+            table,
+            projection,
+            limit,
+            schema,
+            properties,
+        })
+    }
+}
+
+impl DisplayAs for AlgorithmExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "NutmegAlgorithmExec: algorithm={}, graph={}",
+                    self.table.algorithm, self.table.graph
+                )?;
+                if let Some(columns) = &self.projection {
+                    write!(f, ", projection={columns:?}")?;
+                }
+                if let Some(limit) = self.limit {
+                    write!(f, ", limit={limit}")?;
+                }
+                Ok(())
+            }
+            DisplayFormatType::TreeRender => write!(
+                f,
+                "algorithm={}\ngraph={}",
+                self.table.algorithm, self.table.graph
+            ),
+        }
+    }
+}
+
+impl ExecutionPlan for AlgorithmExec {
+    fn name(&self) -> &str {
+        "NutmegAlgorithmExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return internal_err!("NutmegAlgorithmExec has no children");
+        }
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return internal_err!("NutmegAlgorithmExec has one partition, not {partition}");
+        }
+        Ok(Box::pin(AlgorithmStream {
+            table: self.table.clone(),
+            projection: self.projection.clone(),
+            limit: self.limit,
+            rows: 0,
+            schema: self.schema.clone(),
+            state: StreamState::Unstarted,
+        }))
+    }
+}
+
+/// The stream of one streaming read.
+///
+/// On its first poll it creates the read's [`Query`] (so a `timeoutMs`
+/// counts from there) and starts a thread that runs the kernel and sends each
+/// batch through a channel of [`READ_CHANNEL_BATCHES`]. Kernels are
+/// synchronous and CPU-bound, so they run on no thread of the async runtime.
+/// The channel is the backpressure: a thread that has filled it waits for the
+/// consumer, and a cursor that computes batches as they are pulled (all-pairs
+/// shortest paths) waits with it.
+///
+/// Dropping the stream before its end cancels the query. The thread then
+/// stops at whichever comes first: the kernel's next cancellation check,
+/// where it fails with `cancelled`, or its next send, which finds the channel
+/// closed. Either way it drops the cursor and its working memory and returns,
+/// so the thread is detached rather than joined: joining would block the
+/// runtime thread that dropped the stream until that check. [`Registry::reads`]
+/// lists the read as running until the thread has returned from the kernel.
+struct AlgorithmStream {
+    table: Arc<AlgorithmTable>,
+    projection: Option<Vec<usize>>,
+    limit: Option<usize>,
+    rows: usize,
+    schema: SchemaRef,
+    state: StreamState,
+}
+
+enum StreamState {
+    Unstarted,
+    Running(RunningRead),
+    Ended,
+}
+
+struct RunningRead {
+    batches: tokio::sync::mpsc::Receiver<Result<RecordBatch>>,
+    query: Query,
+    /// Whether the thread has sent its last message: then there is nothing
+    /// left to cancel.
+    ended: bool,
+}
+
+impl Drop for RunningRead {
+    fn drop(&mut self) {
+        if !self.ended {
+            // Cancelling a read cannot fail: every Nutmeg read observes
+            // interruption. The closed channel stops the thread regardless.
+            let _ = self.query.cancel();
+        }
+    }
+}
+
+impl AlgorithmStream {
+    fn start(&self) -> Result<RunningRead> {
+        let query = self.table.query()?;
+        let (sender, batches) = tokio::sync::mpsc::channel(READ_CHANNEL_BATCHES);
+        let (table, projection, read) =
+            (self.table.clone(), self.projection.clone(), query.clone());
+        std::thread::Builder::new()
+            .name("nutmeg-read".into())
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    table.read_each(&read, &mut |batch| {
+                        let batch = match &projection {
+                            Some(columns) => batch.project(columns)?,
+                            None => batch,
+                        };
+                        // Blocks while the channel is full; fails once the
+                        // stream is dropped, which stops the read.
+                        Ok(sender.blocking_send(Ok(batch)).is_ok())
+                    })
+                }));
+                let error = match outcome {
+                    Ok(Ok(())) => return,
+                    Ok(Err(error)) => error,
+                    Err(_) => err(format!(
+                        "`{}` on `{}` panicked",
+                        table.algorithm, table.graph
+                    )),
+                };
+                let _ = sender.blocking_send(Err(error));
+            })
+            .map_err(|e| err(format!("could not start a thread for the read: {e}")))?;
+        Ok(RunningRead {
+            batches,
+            query,
+            ended: false,
+        })
+    }
+}
+
+impl futures::Stream for AlgorithmStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = &mut *self;
+        if matches!(this.state, StreamState::Unstarted) {
+            if this.limit == Some(0) {
+                this.state = StreamState::Ended;
+                return Poll::Ready(None);
+            }
+            match this.start() {
+                Ok(running) => this.state = StreamState::Running(running),
+                Err(error) => {
+                    this.state = StreamState::Ended;
+                    return Poll::Ready(Some(Err(error)));
+                }
+            }
+        }
+        let StreamState::Running(running) = &mut this.state else {
+            return Poll::Ready(None);
+        };
+        let batch = match running.batches.poll_recv(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Some(Ok(batch))) => batch,
+            Poll::Ready(end) => {
+                // The thread's last message: the end, or its error.
+                running.ended = true;
+                this.state = StreamState::Ended;
+                return Poll::Ready(end);
+            }
+        };
+        let Some(limit) = this.limit else {
+            return Poll::Ready(Some(Ok(batch)));
+        };
+        let left = limit - this.rows;
+        if batch.num_rows() < left {
+            this.rows += batch.num_rows();
+            return Poll::Ready(Some(Ok(batch)));
+        }
+        // The limit is reached: stop the read, which is no longer needed.
+        this.rows = limit;
+        this.state = StreamState::Ended;
+        Poll::Ready(Some(Ok(batch.slice(0, left))))
+    }
+}
+
+impl RecordBatchStream for AlgorithmStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+/// Every table read, running or recently ended ([`Registry::reads`]), as rows
+/// of `nutmeg_reads()`.
+#[derive(Debug)]
+pub struct ReadsTable;
+
+impl ReadsTable {
+    pub fn arrow_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("readId", DataType::Int64, false),
+            Field::new("algorithm", DataType::Utf8, false),
+            Field::new("graph", DataType::Utf8, false),
+            Field::new("state", DataType::Utf8, false),
+            Field::new("message", DataType::Utf8, true),
+            Field::new("batches", DataType::Int64, false),
+            Field::new("rows", DataType::Int64, false),
+            Field::new("liveBytes", DataType::Int64, false),
+            Field::new("peakBytes", DataType::Int64, false),
+            Field::new("workUnits", DataType::Int64, false),
+        ]))
+    }
+
+    pub fn batches() -> Result<Vec<RecordBatch>> {
+        let rows = Registry::reads()?;
+        let ints = |f: fn(&ReadInfo) -> usize| -> ArrayRef {
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|r| i64::try_from(f(r)).unwrap_or(i64::MAX))
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        let texts = |f: fn(&ReadInfo) -> Option<&str>| -> ArrayRef {
+            Arc::new(StringArray::from(rows.iter().map(f).collect::<Vec<_>>()))
+        };
+        Ok(vec![RecordBatch::try_new(
+            Self::arrow_schema(),
+            vec![
+                ints(|r| r.id as usize),
+                texts(|r| Some(r.algorithm)),
+                texts(|r| Some(r.graph.as_str())),
+                texts(|r| Some(r.state.name())),
+                texts(|r| r.message.as_deref()),
+                ints(|r| r.batches),
+                ints(|r| r.rows),
+                ints(|r| r.live_bytes),
+                ints(|r| r.peak_bytes),
+                ints(|r| r.work_units),
+            ],
+        )?])
+    }
+}
+
+#[async_trait]
+impl TableProvider for ReadsTable {
+    fn schema(&self) -> SchemaRef {
+        Self::arrow_schema()
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Temporary
+    }
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        MemTable::try_new(Self::arrow_schema(), vec![Self::batches()?])?
+            .scan(state, projection, filters, limit)
+            .await
     }
 }
 
@@ -2442,6 +3093,8 @@ impl TableProvider for AlgorithmTable {
     fn table_type(&self) -> TableType {
         TableType::Temporary
     }
+    /// Plans the read without running it, unless the session materialises
+    /// reads (see [`ReadExecution`]).
     async fn scan(
         &self,
         state: &dyn Session,
@@ -2449,9 +3102,18 @@ impl TableProvider for AlgorithmTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        MemTable::try_new(self.schema.clone(), vec![self.batches()?])?
-            .scan(state, projection, filters, limit)
-            .await
+        match ReadExecution::for_session(state)? {
+            ReadExecution::Streaming => Ok(Arc::new(AlgorithmExec::try_new(
+                Arc::new(self.clone()),
+                projection.cloned(),
+                limit,
+            )?)),
+            ReadExecution::Materialized => {
+                MemTable::try_new(self.schema.clone(), vec![self.batches()?])?
+                    .scan(state, projection, filters, limit)
+                    .await
+            }
+        }
     }
 }
 
@@ -2537,6 +3199,19 @@ impl TableFunctionImpl for GraphsFunction {
     }
 }
 
+/// `nutmeg_reads()`.
+#[derive(Debug)]
+struct ReadsFunction;
+
+impl TableFunctionImpl for ReadsFunction {
+    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        if !args.is_empty() {
+            return plan_err!("nutmeg_reads() takes no arguments");
+        }
+        Ok(Arc::new(ReadsTable))
+    }
+}
+
 /// `nutmeg_memory()`.
 #[derive(Debug)]
 struct MemoryFunction;
@@ -2550,8 +3225,8 @@ impl TableFunctionImpl for MemoryFunction {
     }
 }
 
-/// One table function per Grust algorithm, plus `nutmeg_graphs` and
-/// `nutmeg_memory`.
+/// One table function per Grust algorithm, plus `nutmeg_graphs`,
+/// `nutmeg_memory` and `nutmeg_reads`.
 pub fn table_functions() -> Vec<(String, Arc<TableFunction>)> {
     let mut out: Vec<(String, Arc<TableFunction>)> = algorithm_names()
         .into_iter()
@@ -2575,6 +3250,13 @@ pub fn table_functions() -> Vec<(String, Arc<TableFunction>)> {
         Arc::new(TableFunction::new(
             "nutmeg_memory".into(),
             Arc::new(MemoryFunction),
+        )),
+    ));
+    out.push((
+        "nutmeg_reads".into(),
+        Arc::new(TableFunction::new(
+            "nutmeg_reads".into(),
+            Arc::new(ReadsFunction),
         )),
     ));
     out
