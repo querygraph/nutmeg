@@ -61,7 +61,10 @@ fn unsigned(data_type: &DataType) -> bool {
 /// from a real run, and the graph listing.
 #[test]
 fn no_column_nutmeg_serves_is_unsigned() {
-    let mut schemas = vec![("graphs".to_string(), GraphsTable::arrow_schema())];
+    let mut schemas = vec![
+        ("graphs".to_string(), GraphsTable::arrow_schema()),
+        ("memory".to_string(), MemoryTable::arrow_schema()),
+    ];
     for name in algorithm_names() {
         let schema = output_schema(name).unwrap_or_else(|e| panic!("{name}: {e}"));
         schemas.push((name.to_string(), schema));
@@ -1386,7 +1389,7 @@ fn canonical_order_covers_the_whole_part_across_appends() {
 }
 
 fn staged(name: &str, part: Part) -> Vec<RecordBatch> {
-    let entry = Registry::entry(name, false).unwrap().unwrap();
+    let entry = Registry::entry(name).unwrap().unwrap();
     let e = entry.read().unwrap();
     match part {
         Part::Nodes => e.nodes.clone(),
@@ -1470,7 +1473,7 @@ fn canonical_order_is_text_order_on_ids_and_breaks_ties_by_the_other_columns() {
     )
     .unwrap();
     assert_eq!(
-        strings_of(&Registry::node_batches(name).unwrap(), "node_id"),
+        strings_of(&Registry::node_batches(name).unwrap().0, "node_id"),
         ["10", "2", "9"]
     );
     // As staged, rows keep their arrival order, and derived nodes the order
@@ -1489,7 +1492,7 @@ fn canonical_order_is_text_order_on_ids_and_breaks_ties_by_the_other_columns() {
         ["9", "9", "10", "9"]
     );
     assert_eq!(
-        strings_of(&Registry::node_batches(name).unwrap(), "node_id"),
+        strings_of(&Registry::node_batches(name).unwrap().0, "node_id"),
         ["9", "2", "10"]
     );
     assert!(Registry::drop(name).unwrap());
@@ -1616,4 +1619,556 @@ fn the_order_option_parses_in_either_case() {
         error.contains(ORDER_OPTION) && error.contains("asStaged"),
         "{error}"
     );
+}
+
+// ---- The memory budget over staging, sorting and projections ----
+
+/// `rows` edges `n{i}` → `n{(i * 7 + 1) % rows}` numbered from `first`,
+/// weighted, in reverse id order so a canonical write has sorting to do.
+fn budget_edges(first: usize, rows: usize) -> RecordBatch {
+    let ids: Vec<usize> = (first..first + rows).rev().collect();
+    let source: Vec<String> = ids.iter().map(|i| format!("n{i:08}")).collect();
+    let target: Vec<String> = ids
+        .iter()
+        .map(|i| format!("n{:08}", first + (i * 7 + 1) % rows))
+        .collect();
+    let source: Vec<&str> = source.iter().map(String::as_str).collect();
+    let target: Vec<&str> = target.iter().map(String::as_str).collect();
+    let weight: Vec<f64> = ids.iter().map(|i| (i % 5) as f64).collect();
+    edges(&source, &target, Some(&weight))
+}
+
+/// What one write costs at its peak, and what it holds after, measured on a
+/// budget that cannot refuse it.
+fn cost(batch: &RecordBatch, order: StageOrder) -> (usize, usize) {
+    let store = Store::new(usize::MAX);
+    store
+        .stage(
+            "cost",
+            Part::Edges,
+            std::slice::from_ref(batch),
+            &ColumnMapping::default(),
+            true,
+            order,
+        )
+        .unwrap();
+    let memory = store.memory().unwrap();
+    (memory.peak_bytes, memory.used_bytes)
+}
+
+fn part_of(store: &Store, name: &str) -> Vec<RecordBatch> {
+    let entry = store.entry(name).unwrap().unwrap();
+    let e = entry.read().unwrap();
+    e.edges.clone()
+}
+
+fn info_of(store: &Store, name: &str) -> Option<GraphInfo> {
+    store.list().unwrap().into_iter().find(|g| g.name == name)
+}
+
+/// A write that does not fit is refused with the graph, the part and the
+/// sizes named, and the graph is exactly as it was: the same rows, the same
+/// revision, its projection still cached, the same bytes held. A refused
+/// write to a new graph leaves no graph behind, and a refused replace keeps
+/// the rows it would have replaced.
+#[test]
+fn a_write_over_the_budget_is_refused_and_leaves_the_graph_as_it_was() {
+    let small = budget_edges(0, 200);
+    let large = budget_edges(1_000, 20_000);
+    let (small_peak, small_held) = cost(&small, StageOrder::Canonical);
+    let (large_peak, _) = cost(&large, StageOrder::Canonical);
+    assert!(large_peak > 20 * small_peak, "{large_peak} vs {small_peak}");
+    // Room for the small graph and its projection, with plenty to spare,
+    // and far less than the large write.
+    let limit = 10 * small_peak;
+    let store = Store::new(limit);
+    let mapping = ColumnMapping::default();
+    let name = "refused";
+    store
+        .stage(
+            name,
+            Part::Edges,
+            &[small],
+            &mapping,
+            true,
+            StageOrder::Canonical,
+        )
+        .unwrap();
+    let projection = store
+        .projection(name, &validate("wcc", &no_options()).unwrap())
+        .unwrap();
+    drop(projection);
+    let before_rows = part_of(&store, name);
+    let before = info_of(&store, name).unwrap();
+    let used_before = store.memory().unwrap().used_bytes;
+    assert_eq!(before.staged_bytes, small_held);
+    assert_eq!(before.projections, 1);
+    assert!(
+        used_before > before.staged_bytes,
+        "the projection is admitted too"
+    );
+
+    for (replace, order) in [
+        (false, StageOrder::Canonical),
+        (true, StageOrder::Canonical),
+        (false, StageOrder::AsStaged),
+        (true, StageOrder::AsStaged),
+    ] {
+        let error = store
+            .stage(
+                name,
+                Part::Edges,
+                std::slice::from_ref(&large),
+                &mapping,
+                replace,
+                order,
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, DataFusionError::ResourcesExhausted(_)),
+            "{message}"
+        );
+        for expected in [
+            "`refused`",
+            "its edges",
+            &format!("{limit}-byte"),
+            MEMORY_BYTES_VARIABLE,
+        ] {
+            assert!(message.contains(expected), "{expected} in {message}");
+        }
+        let after = info_of(&store, name).unwrap();
+        assert_eq!(
+            part_of(&store, name),
+            before_rows,
+            "replace: {replace}, {order:?}"
+        );
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.staged_edges, 200);
+        assert_eq!(after.staged_bytes, before.staged_bytes);
+        assert_eq!(after.projections, 1, "the cached projection survives");
+        assert_eq!(store.memory().unwrap().used_bytes, used_before);
+    }
+
+    let error = store
+        .stage(
+            "never-staged",
+            Part::Edges,
+            &[large],
+            &mapping,
+            true,
+            StageOrder::Canonical,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("`never-staged`"), "{error}");
+    assert!(info_of(&store, "never-staged").is_none());
+    assert_eq!(store.memory().unwrap().used_bytes, used_before);
+}
+
+/// Canonical order sorts into a second copy of the part, beside the
+/// permutation and the sort keys; all of that is admitted before the sort
+/// starts. A write whose rows fit but whose sort does not is refused under
+/// canonical order, naming the sort and the opt-out, and admitted as staged.
+/// Once sorted, the part holds its copy, not the working space.
+#[test]
+fn the_sorts_working_space_is_admitted_before_the_sort() {
+    let batch = budget_edges(0, 5_000);
+    let (as_staged, as_staged_held) = cost(&batch, StageOrder::AsStaged);
+    let (canonical, canonical_held) = cost(&batch, StageOrder::Canonical);
+    // As staged, a write holds its renamed rows and nothing more.
+    assert_eq!(as_staged, as_staged_held);
+    // Sorted, it also needs the copy and the permutation at once.
+    assert!(
+        canonical > as_staged + as_staged_held / 2,
+        "{canonical} vs {as_staged}"
+    );
+    let limit = (as_staged + canonical) / 2;
+    let store = Store::new(limit);
+    let mapping = ColumnMapping::default();
+    let error = store
+        .stage(
+            "sorted",
+            Part::Edges,
+            std::slice::from_ref(&batch),
+            &mapping,
+            true,
+            StageOrder::Canonical,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("sort's working space") && error.contains("asStaged"),
+        "{error}"
+    );
+    assert!(info_of(&store, "sorted").is_none());
+    assert_eq!(store.memory().unwrap().used_bytes, 0);
+    let rows = store
+        .stage(
+            "sorted",
+            Part::Edges,
+            std::slice::from_ref(&batch),
+            &mapping,
+            true,
+            StageOrder::AsStaged,
+        )
+        .unwrap();
+    assert_eq!(rows, 5_000);
+    assert_eq!(
+        info_of(&store, "sorted").unwrap().staged_bytes,
+        as_staged_held
+    );
+
+    // What a part is charged covers what it keeps alive, and for a sorted
+    // part exceeds it by no more than the bound's rounding.
+    let sorted = Store::new(usize::MAX);
+    sorted
+        .stage(
+            "s",
+            Part::Edges,
+            &[batch],
+            &mapping,
+            true,
+            StageOrder::Canonical,
+        )
+        .unwrap();
+    let held = held_bytes(&part_of(&sorted, "s"));
+    assert_eq!(info_of(&sorted, "s").unwrap().staged_bytes, canonical_held);
+    assert!(canonical_held >= held, "{canonical_held} < {held}");
+    assert!(
+        canonical_held - held < held / 10,
+        "charged {canonical_held} for {held}"
+    );
+}
+
+/// Bytes are measured as the allocations the rows keep alive: a slice keeps
+/// its whole buffer, and buffers shared between slices count once.
+#[test]
+fn held_bytes_counts_each_allocation_once_at_its_capacity() {
+    let batch = budget_edges(0, 1_000);
+    let whole = held_bytes(std::slice::from_ref(&batch));
+    assert!(whole >= batch.get_array_memory_size() / 2, "{whole}");
+    let halves = [batch.slice(0, 500), batch.slice(500, 500)];
+    assert_eq!(held_bytes(&halves), whole);
+    assert_eq!(held_bytes(&[batch.slice(0, 10)]), whole);
+    assert_eq!(held_bytes(&[batch.clone(), batch.clone()]), whole);
+
+    // Staged as they are, ten rows sliced from a thousand keep the thousand;
+    // sorted, they are copied compactly and keep only themselves.
+    let store = Store::new(usize::MAX);
+    let mapping = ColumnMapping::default();
+    let slice = batch.slice(0, 10);
+    store
+        .stage(
+            "slice",
+            Part::Edges,
+            std::slice::from_ref(&slice),
+            &mapping,
+            true,
+            StageOrder::AsStaged,
+        )
+        .unwrap();
+    let kept = info_of(&store, "slice").unwrap().staged_bytes;
+    assert!(kept >= whole / 2, "{kept} of {whole}");
+    store
+        .stage(
+            "slice",
+            Part::Edges,
+            &[slice],
+            &mapping,
+            true,
+            StageOrder::Canonical,
+        )
+        .unwrap();
+    let sorted = info_of(&store, "slice").unwrap().staged_bytes;
+    assert!(sorted < whole / 5, "{sorted} of {whole}");
+}
+
+/// Replacing a part, restaging (which evicts the graph's cached
+/// projections) and dropping a graph each return their bytes; a projection
+/// still held by a running read keeps its bytes until that read lets go. With
+/// the bytes back, a write the budget refused is admitted.
+#[test]
+fn drop_and_restage_return_their_bytes_and_the_budget_recovers() {
+    let first = budget_edges(0, 4_000);
+    let second = budget_edges(10_000, 4_000);
+    let (peak, held) = cost(&first, StageOrder::Canonical);
+    let mapping = ColumnMapping::default();
+    let wcc = validate("wcc", &no_options()).unwrap();
+    let stage = |store: &Store, name: &str, batch: &RecordBatch, replace: bool| {
+        store.stage(
+            name,
+            Part::Edges,
+            std::slice::from_ref(batch),
+            &mapping,
+            replace,
+            StageOrder::Canonical,
+        )
+    };
+
+    // Room for one such graph, not for two.
+    let store = Store::new(peak + held / 2);
+    stage(&store, "one", &first, true).unwrap();
+    assert_eq!(store.memory().unwrap().used_bytes, held);
+    let error = stage(&store, "two", &second, true).unwrap_err().to_string();
+    assert!(error.contains("`two`"), "{error}");
+    // Nor for its projection: that is admitted from the same budget.
+    let error = store
+        .projection("one", &wcc)
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(
+        error.contains("`one`") && error.contains("projection"),
+        "{error}"
+    );
+    assert_eq!(store.memory().unwrap().used_bytes, held);
+    assert!(store.drop("one").unwrap());
+    assert_eq!(store.memory().unwrap().used_bytes, 0);
+    assert_eq!(store.memory().unwrap().staged_bytes, 0);
+    stage(&store, "two", &second, true).unwrap();
+    assert_eq!(info_of(&store, "two").unwrap().staged_edges, 4_000);
+
+    // A projection is admitted from the same budget and released on restage.
+    let store = Store::new(usize::MAX);
+    let stage =
+        |name: &str, batch: &RecordBatch, replace: bool| stage(&store, name, batch, replace);
+    stage("one", &first, true).unwrap();
+    let projection = store.projection("one", &wcc).unwrap();
+    let with_projection = store.memory().unwrap().used_bytes;
+    assert!(with_projection > held);
+    stage("one", &first, true).unwrap();
+    assert_eq!(info_of(&store, "one").unwrap().projections, 0);
+    // The read still holding the old projection keeps its bytes...
+    assert_eq!(store.memory().unwrap().used_bytes, with_projection);
+    drop(projection);
+    // ...until it lets go.
+    assert_eq!(store.memory().unwrap().used_bytes, held);
+
+    // Replacing with fewer rows holds fewer bytes.
+    stage("one", &first.slice(0, 1_000), true).unwrap();
+    let smaller = store.memory().unwrap().used_bytes;
+    assert!(smaller < held / 2, "{smaller} vs {held}");
+    assert_eq!(info_of(&store, "one").unwrap().staged_bytes, smaller);
+    // An empty replace holds nothing, and the graph stays listed.
+    store
+        .stage(
+            "one",
+            Part::Edges,
+            &[],
+            &mapping,
+            true,
+            StageOrder::Canonical,
+        )
+        .unwrap();
+    assert_eq!(store.memory().unwrap().used_bytes, 0);
+    assert!(info_of(&store, "one").is_some());
+    // Dropping a graph releases its rows and its cached projections.
+    stage("one", &first, true).unwrap();
+    store.projection("one", &wcc).unwrap();
+    assert!(store.memory().unwrap().used_bytes > held);
+    assert!(store.drop("one").unwrap());
+    assert_eq!(store.memory().unwrap().used_bytes, 0);
+}
+
+/// A write fed a batch at a time, as Sail's sink feeds it, is refused at the
+/// batch that crosses the budget, before the rest arrive; the graph is
+/// untouched until `finish`. The handle can be held across an `await`.
+#[test]
+fn a_streamed_write_is_refused_at_the_batch_that_crosses_the_budget() {
+    fn send<T: Send>(_: &T) {}
+    send(&Registry::staging(
+        "unused",
+        Part::Edges,
+        &ColumnMapping::default(),
+        true,
+        StageOrder::Canonical,
+    ));
+    let batch = budget_edges(0, 1_000);
+    let (_, held) = cost(&batch, StageOrder::AsStaged);
+    let store = Store::new(3 * held + held / 2);
+    let mapping = ColumnMapping::default();
+    let mut staging = store.staging(
+        "streamed",
+        Part::Edges,
+        &mapping,
+        true,
+        StageOrder::AsStaged,
+    );
+    for _ in 0..3 {
+        staging.push(&batch).unwrap();
+        assert!(info_of(&store, "streamed").is_none());
+    }
+    let error = staging.push(&batch).unwrap_err().to_string();
+    assert!(
+        error.contains("`streamed`") && error.contains("1000 more rows"),
+        "{error}"
+    );
+    assert_eq!(store.memory().unwrap().used_bytes, 3 * held);
+    drop(staging);
+    assert_eq!(store.memory().unwrap().used_bytes, 0);
+    let mut staging = store.staging(
+        "streamed",
+        Part::Edges,
+        &mapping,
+        true,
+        StageOrder::AsStaged,
+    );
+    for _ in 0..3 {
+        staging.push(&batch).unwrap();
+    }
+    assert_eq!(staging.finish().unwrap(), 3_000);
+    assert_eq!(info_of(&store, "streamed").unwrap().staged_bytes, 3 * held);
+}
+
+/// The graph listing reports each graph's staged bytes, and `nutmeg_memory()`
+/// the budget, what is in use and the staged total, through SQL.
+#[tokio::test]
+async fn the_listing_reports_bytes_per_graph_and_in_total() -> Result<()> {
+    use arrow::datatypes::Int64Type;
+    let name = "listed-bytes";
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[budget_edges(0, 100)],
+        &ColumnMapping::default(),
+        true,
+        StageOrder::Canonical,
+    )?;
+    let staged = Registry::list()?
+        .into_iter()
+        .find(|g| g.name == name)
+        .unwrap()
+        .staged_bytes;
+    assert!(staged > 0);
+    let ctx = SessionContext::new();
+    register(&ctx);
+    let batches = ctx
+        .sql(&format!(
+            "SELECT \"stagedBytes\" FROM nutmeg_graphs() WHERE name = '{name}'"
+        ))
+        .await?
+        .collect()
+        .await?;
+    let listed = batches[0].column(0).as_primitive::<Int64Type>().value(0);
+    assert_eq!(listed as usize, staged);
+    let batches = ctx
+        .sql(
+            "SELECT \"limitBytes\", \"usedBytes\", \"stagedBytes\", \"peakBytes\" \
+             FROM nutmeg_memory()",
+        )
+        .await?
+        .collect()
+        .await?;
+    let value = |c: usize| batches[0].column(c).as_primitive::<Int64Type>().value(0) as usize;
+    assert_eq!(value(0), memory_bytes());
+    // Other tests stage and drop at the same time, so only the order holds.
+    assert!(
+        value(2) > 0 && value(1) >= value(2) && value(3) >= value(1),
+        "{batches:?}"
+    );
+    assert!(Registry::drop(name)?);
+    Ok(())
+}
+
+/// Writes to different graphs, from many threads at once, can never hold
+/// more than the budget together. Each thread stages its own graph (sorted,
+/// so each write has a transient peak), checks it, and drops it, over and
+/// over; the budget has room for about two such graphs, so many writes are
+/// refused. A monitor measures, while they run, the bytes the staged rows
+/// actually keep alive, and checks them against what each graph was charged,
+/// and the charges against the budget.
+#[test]
+fn concurrent_writes_to_different_graphs_never_exceed_the_budget() {
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 40;
+    let batch = budget_edges(0, 2_000);
+    let (peak, held) = cost(&batch, StageOrder::Canonical);
+    let limit = peak + held + held / 2;
+    let store = Store::new(limit);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let (admitted, refused) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let most_held = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let monitor = scope.spawn(|| {
+            let mut samples = 0usize;
+            while !done.load(Ordering::Acquire) {
+                let mut measured = 0usize;
+                let mut charged = 0usize;
+                for graph in store.list().unwrap() {
+                    let Some(entry) = store.entry(&graph.name).unwrap() else {
+                        continue;
+                    };
+                    let e = entry.read().unwrap();
+                    let keeps = held_bytes(&e.edges);
+                    let charge = e.edge_bytes.bytes();
+                    assert!(
+                        keeps <= charge,
+                        "{}: keeps {keeps}, charged {charge}",
+                        graph.name
+                    );
+                    measured += keeps;
+                    charged += charge;
+                }
+                assert!(measured <= limit, "staged rows keep {measured} of {limit}");
+                assert!(charged <= limit, "charged {charged} of {limit}");
+                let used = store.memory().unwrap().used_bytes;
+                assert!(used <= limit, "{used} of {limit}");
+                most_held.fetch_max(measured, Ordering::Relaxed);
+                samples += 1;
+                std::thread::yield_now();
+            }
+            samples
+        });
+        let writers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let (store, batch) = (&store, &batch);
+                let (admitted, refused) = (&admitted, &refused);
+                scope.spawn(move || {
+                    let name = format!("concurrent-{t}");
+                    for _ in 0..ROUNDS {
+                        match store.stage(
+                            &name,
+                            Part::Edges,
+                            std::slice::from_ref(batch),
+                            &ColumnMapping::default(),
+                            true,
+                            StageOrder::Canonical,
+                        ) {
+                            Ok(rows) => {
+                                assert_eq!(rows, 2_000);
+                                admitted.fetch_add(1, Ordering::Relaxed);
+                                std::thread::yield_now();
+                                assert!(store.drop(&name).unwrap());
+                            }
+                            Err(error) => {
+                                assert!(
+                                    matches!(error, DataFusionError::ResourcesExhausted(_)),
+                                    "{error}"
+                                );
+                                assert!(store.entry(&name).unwrap().is_none());
+                                refused.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        done.store(true, Ordering::Release);
+        assert!(monitor.join().unwrap() > 0);
+    });
+    let (admitted, refused) = (admitted.into_inner(), refused.into_inner());
+    assert_eq!(admitted + refused, THREADS * ROUNDS);
+    assert!(admitted > 0, "no write was admitted");
+    assert!(
+        refused > 0,
+        "no write was refused, so the budget was never contended"
+    );
+    let memory = store.memory().unwrap();
+    assert!(memory.peak_bytes <= limit, "{memory:?}");
+    assert_eq!(memory.used_bytes, 0, "every byte was returned: {memory:?}");
+    assert!(most_held.into_inner() <= limit);
 }

@@ -105,12 +105,57 @@ write lock. Rows are compared in Arrow's row format. Time is O(n log n) in
 the part's rows, so staging in k appends costs k such sorts. Peak memory is
 about twice the part, plus the sort keys (the key columns encoded) and 16
 bytes of permutation per row. For edges the keys are the ids, the type and
-the numeric properties. For nodes they are only the ids. Like staging
-itself, the sort is not charged against the projection's memory admission
-(`NUTMEG_MEMORY_BYTES`) or its work limit. That admission starts when a
-projection is built, and the staged rows, sorted or not, are held outside
-it. Stage a large graph in one write rather than many appends, or use
-`asStaged` if the order is already fixed.
+the numeric properties. For nodes they are only the ids. That peak is
+admitted from the memory budget before the sort starts (see below), so a
+write whose rows fit but whose sort does not is refused under `canonical`
+and accepted under `asStaged`. Stage a large graph in one write rather than
+many appends, or use `asStaged` if the order is already fixed.
+
+## Memory
+
+One budget bounds everything Nutmeg holds in the Sail process: the staged
+rows of every graph, each write's transient copies and its sort, every
+cached projection, and the kernels running on them. It is set in bytes by
+the `NUTMEG_MEMORY_BYTES` environment variable when the server starts, and
+defaults to 8 GiB (`8589934592`). For example:
+
+```sh
+NUTMEG_MEMORY_BYTES=34359738368 nutmeg-server   # 32 GiB
+```
+
+The budget is fixed once the first graph is staged. Before this change the
+variable limited each projection separately and staging was not counted at
+all. It now limits the process total.
+
+The budget is Grust's own admission: one `ExecutionContext` whose
+reservations are taken before memory is allocated and returned when the
+memory is freed. A write is admitted a batch at a time as Sail streams it:
+
+- Each incoming batch is refused before it is copied if its rows cannot fit
+  in what is free. What the renamed batch keeps alive is then admitted.
+- A canonical write admits the sort's permutation, the larger of its keys and
+  its sorted copy, before sorting.
+- The new part is built aside and swapped in. A refused write leaves the
+  graph exactly as it was: the same rows, revision, cached projections and
+  bytes. A refused write to a new graph leaves no graph behind.
+- The error is `ResourcesExhausted`. It names the graph, the part, what the
+  write needed, what is in use and the limit.
+
+Bytes are measured as the Arrow allocations the rows keep alive, each counted
+once at its capacity. A batch sliced from a larger one is charged for the
+whole buffer when it is staged `asStaged`. A canonical write copies it
+compactly. Replacing a part, restaging (which evicts the graph's cached
+projections) and `Registry::drop` return their bytes. A read still running
+on an evicted projection holds its bytes until it finishes.
+
+To see what is using memory, `nutmeg_graphs()` and
+`spark.read.format("nutmeg").load()` report `stagedBytes` per graph.
+`SELECT * FROM nutmeg_memory()` reports:
+
+- `limitBytes`
+- `usedBytes`: staged rows, writes in progress, projections and kernels
+- `stagedBytes`: the total over graphs
+- `peakBytes`
 
 ## Sail
 

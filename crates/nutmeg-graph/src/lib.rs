@@ -20,6 +20,13 @@
 //! Kernels run in process with Grust's work charging and memory admission,
 //! and results leave through Grust's Arrow result cursors.
 //!
+//! One memory budget (`NUTMEG_MEMORY_BYTES`, 8 GiB by default) bounds all of
+//! it: staged rows across every graph, each write's transient copies and its
+//! sort, cached projections and running kernels. It is a Grust
+//! `ExecutionContext`, so a write is admitted before its rows are copied and
+//! refused, leaving the graph as it was, when it does not fit; see
+//! [`Staging`] and [`Registry::memory`].
+//!
 //! This crate knows nothing about Sail or Spark: it registers into any
 //! DataFusion 55 `SessionContext`. `nutmeg-sail` adapts it to a Sail session.
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -27,9 +34,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float64Array, Int64Array, StringArray,
-    new_null_array,
+    Array, ArrayData, ArrayRef, AsArray, BooleanArray, FixedSizeListArray, Float64Array,
+    Int64Array, StringArray, StringBuilder, new_null_array,
 };
+use arrow::buffer::{Buffer, OffsetBuffer};
 use arrow::compute::{SortOptions, cast, interleave, is_not_null};
 use arrow::datatypes::{DataType, Field, Float32Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -47,10 +55,10 @@ use grust_algorithms::{
 };
 use grust_core::Value;
 use grust_procedures::{
-    ExecutionContext, ExecutionLimits, ProcedureDefinition, ProcedureRegistry, RegistryBuilder,
-    SnapshotIdentity, ValidatedArguments, ValueType,
+    ExecutionContext, ExecutionLimits, MemoryReservation, ProcedureDefinition, ProcedureError,
+    ProcedureRegistry, RegistryBuilder, SnapshotIdentity, ValidatedArguments, ValueType,
 };
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 
 const PREFIX: &str = "grust.algorithms.";
 
@@ -249,18 +257,33 @@ pub fn resolve_algorithm(name: &str) -> Option<&'static str> {
         .find(|n| n.to_ascii_lowercase() == wanted)
 }
 
-/// Memory admitted to one projection and the kernels run on it.
-static MEMORY_BYTES: AtomicUsize = AtomicUsize::new(8 << 30);
+/// The process's memory budget when neither `NUTMEG_MEMORY_BYTES` nor
+/// [`set_memory_bytes`] sets one: 8 GiB.
+pub const DEFAULT_MEMORY_BYTES: usize = 8 << 30;
 
-/// Set the admission limit for projections built from now on. The
+/// The environment variable that sets the memory budget, in bytes.
+pub const MEMORY_BYTES_VARIABLE: &str = "NUTMEG_MEMORY_BYTES";
+
+static MEMORY_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MEMORY_BYTES);
+
+/// Set the process's memory budget (see [`Registry::memory`]). The budget is
+/// fixed when the registry is first used, so this is refused afterwards: the
+/// bytes already admitted were admitted against the old one. The
 /// `NUTMEG_MEMORY_BYTES` environment variable, when set, wins.
-pub fn set_memory_bytes(bytes: usize) {
+pub fn set_memory_bytes(bytes: usize) -> Result<()> {
+    if STORE.get().is_some() {
+        return exec_err!(
+            "nutmeg: the memory budget is fixed once the first graph is staged; \
+             set it at startup, or with {MEMORY_BYTES_VARIABLE}"
+        );
+    }
     MEMORY_BYTES.store(bytes, Ordering::Relaxed);
+    Ok(())
 }
 
 fn memory_bytes() -> usize {
     static ENV: Lazy<Option<usize>> =
-        Lazy::new(|| std::env::var("NUTMEG_MEMORY_BYTES").ok()?.parse().ok());
+        Lazy::new(|| std::env::var(MEMORY_BYTES_VARIABLE).ok()?.parse().ok());
     ENV.unwrap_or_else(|| MEMORY_BYTES.load(Ordering::Relaxed))
 }
 
@@ -552,12 +575,29 @@ const SORTED_BATCH_ROWS: usize = 64 * 1024;
 /// (batch, row) positions compared through Arrow's row format, and the rows
 /// are then gathered into batches of [`SORTED_BATCH_ROWS`], so no column is
 /// ever concatenated past Arrow's 32-bit offsets.
-fn canonicalize(part: Part, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+///
+/// The sort's working space is admitted from `budget` before the sort starts:
+/// the permutation, and whichever is larger of the sort keys and the sorted
+/// copy, since the keys are freed before the copy is made. The input stays
+/// held throughout, by the caller's admissions. What is returned beside the
+/// sorted batches is the admission for the copy, which the part keeps; the
+/// rest is released on return.
+fn canonicalize(
+    part: Part,
+    batches: Vec<RecordBatch>,
+    budget: &Budget<'_>,
+) -> Result<(Vec<RecordBatch>, Admitted)> {
     let batches: Vec<RecordBatch> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
     if batches.is_empty() {
-        return Ok(batches);
+        return Ok((batches, Admitted::default()));
     }
-    let batches = unify(batches)?;
+    let mut work = Admitted::default();
+    let (batches, filled) = unify(batches)?;
+    // Columns an append lacked, made just now; small beside the part, and
+    // measured rather than bounded, since `new_null_array` sizes by type.
+    budget.admit(&mut work, filled, || {
+        format!("{filled} bytes of columns an append lacked")
+    })?;
     let schema = batches[0].schema();
     let structural: &[&str] = match part {
         Part::Nodes => &["node_id"],
@@ -594,6 +634,33 @@ fn canonicalize(part: Part, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
             })
             .collect(),
     )?;
+
+    // Admit the working space before any of it is allocated.
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let permutation = total.saturating_mul(size_of::<(usize, usize)>());
+    let keys_bound = batches
+        .iter()
+        .map(|batch| key_bytes_bound(batch, &key))
+        .try_fold(0usize, |sum, bytes| Some(sum.saturating_add(bytes?)));
+    let copy = sorted_copy_bound(&batches);
+    let keys = keys_bound.unwrap_or(0);
+    let beyond_copy = keys.saturating_sub(copy);
+    let need = permutation.saturating_add(beyond_copy).saturating_add(copy);
+    let describe = || {
+        format!(
+            "the sort's working space: {permutation} bytes of permutation, about {keys} of sort \
+             keys and {copy} for the sorted copy of {total} rows (stage with `{ORDER_OPTION}` = \
+             `asStaged` to skip the sort)"
+        )
+    };
+    let mut sorted = Admitted::default();
+    budget.admit(&mut work, permutation.saturating_add(beyond_copy), || {
+        format!("{need} bytes of {}", describe())
+    })?;
+    budget.admit(&mut sorted, copy, || {
+        format!("{need} bytes of {}", describe())
+    })?;
+
     let rows: Vec<Rows> = batches
         .iter()
         .map(|batch| {
@@ -601,11 +668,20 @@ fn canonicalize(part: Part, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
             converter.convert_columns(&columns)
         })
         .collect::<std::result::Result<_, _>>()?;
-    let mut order: Vec<(usize, usize)> = batches
-        .iter()
-        .enumerate()
-        .flat_map(|(b, batch)| (0..batch.num_rows()).map(move |r| (b, r)))
-        .collect();
+    // A key type the bound does not cover is measured once encoded, and any
+    // excess over the room admitted for keys is admitted before the sort.
+    let encoded: usize = rows.iter().map(Rows::size).sum();
+    let room = keys.max(copy);
+    if encoded > room {
+        let excess = encoded - room;
+        budget.admit(&mut work, excess, || {
+            format!("{excess} bytes more of sort keys, measured once encoded")
+        })?;
+    }
+    let mut order: Vec<(usize, usize)> = Vec::with_capacity(total);
+    for (b, batch) in batches.iter().enumerate() {
+        order.extend((0..batch.num_rows()).map(|r| (b, r)));
+    }
     // Unstable is enough: rows that compare equal are equal in every column
     // the key covers, and those are all the columns a kernel reads.
     order.sort_unstable_by(|x, y| rows[x.0].row(x.1).cmp(&rows[y.0].row(y.1)));
@@ -621,7 +697,114 @@ fn canonicalize(part: Part, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
             .collect::<std::result::Result<Vec<_>, _>>()?;
         out.push(RecordBatch::try_new(schema.clone(), columns)?);
     }
-    Ok(out)
+    // The bound covers every type `interleave` copies exactly; anything it
+    // underestimated is admitted now, and refused like the rest.
+    let held = held_bytes(&out);
+    if held > sorted.bytes() {
+        let excess = held - sorted.bytes();
+        budget.admit(&mut sorted, excess, || {
+            format!("{excess} bytes more for the sorted copy, measured once made")
+        })?;
+    }
+    Ok((out, sorted))
+}
+
+/// An upper bound on the bytes Arrow's row format takes to encode the `key`
+/// columns of `batch`, offsets included, or `None` for a key type it does not
+/// bound (measured instead, once encoded). Per value: one byte of null
+/// sentinel plus the width for fixed-width types, and for bytes and strings
+/// at most `37 + 9/8 × len` (mini-blocks of 8 bytes plus a continuation byte
+/// up to 32 bytes, then blocks of 32 plus one).
+fn key_bytes_bound(batch: &RecordBatch, key: &[usize]) -> Option<usize> {
+    let rows = batch.num_rows();
+    let mut bytes = size_of::<Rows>().saturating_add((rows + 1).saturating_mul(size_of::<usize>()));
+    for &index in key {
+        let column = batch.column(index);
+        let values = match column.data_type() {
+            DataType::Utf8 => {
+                let offsets = column.as_string::<i32>().offsets();
+                Some((offsets[rows] - offsets[0]) as usize)
+            }
+            DataType::LargeUtf8 => {
+                let offsets = column.as_string::<i64>().offsets();
+                Some((offsets[rows] - offsets[0]) as usize)
+            }
+            DataType::Binary => {
+                let offsets = column.as_binary::<i32>().offsets();
+                Some((offsets[rows] - offsets[0]) as usize)
+            }
+            DataType::LargeBinary => {
+                let offsets = column.as_binary::<i64>().offsets();
+                Some((offsets[rows] - offsets[0]) as usize)
+            }
+            _ => None,
+        };
+        let encoded = match (values, column.data_type()) {
+            (Some(values), _) => rows
+                .saturating_mul(37)
+                .saturating_add(values.saturating_mul(9).div_ceil(8)),
+            (None, DataType::Boolean) => rows.saturating_mul(2),
+            (None, DataType::Null) => rows,
+            (None, kind) => rows.saturating_mul(1 + kind.primitive_width()?),
+        };
+        bytes = bytes.saturating_add(encoded);
+    }
+    Some(bytes)
+}
+
+/// An upper bound on the bytes the sorted copy of `batches` takes: every
+/// value once, as [`ArrayData::get_slice_memory_size`] counts it, plus per
+/// output batch and column an offset, a null bitmap that the input may not
+/// have had, and 64-byte rounding of each buffer.
+fn sorted_copy_bound(batches: &[RecordBatch]) -> usize {
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let columns = batches.first().map_or(0, |b| b.num_columns());
+    let values: usize = batches
+        .iter()
+        .flat_map(|b| b.columns())
+        .map(|column| slice_bytes(column.as_ref()))
+        .fold(0, usize::saturating_add);
+    let chunks = rows.div_ceil(SORTED_BATCH_ROWS);
+    let per_column = rows
+        .div_ceil(8)
+        .saturating_add(chunks.saturating_mul(4 * 64 + 16));
+    values.saturating_add(columns.saturating_mul(per_column))
+}
+
+/// The bytes `array`'s own rows occupy, not counting whatever else the buffers
+/// it slices hold: the size a compact copy of it would have.
+fn slice_bytes(array: &dyn Array) -> usize {
+    let data = array.to_data();
+    data.get_slice_memory_size()
+        .unwrap_or_else(|_| data.get_buffer_memory_size())
+}
+
+/// The bytes `batches` keep alive: every distinct allocation their arrays
+/// reference, at its full capacity, counted once. A slice keeps its whole
+/// buffer alive, so a batch sliced from a larger one is charged for all of
+/// it; two columns or batches that share an allocation are charged for it
+/// once.
+pub fn held_bytes(batches: &[RecordBatch]) -> usize {
+    fn visit(data: &ArrayData, seen: &mut HashMap<usize, usize>) {
+        for buffer in data.buffers() {
+            seen.insert(buffer.data_ptr().as_ptr() as usize, buffer.capacity());
+        }
+        if let Some(nulls) = data.nulls() {
+            let buffer = nulls.buffer();
+            seen.insert(buffer.data_ptr().as_ptr() as usize, buffer.capacity());
+        }
+        for child in data.child_data() {
+            visit(child, seen);
+        }
+    }
+    let mut seen = HashMap::new();
+    for batch in batches {
+        for column in batch.columns() {
+            visit(&column.to_data(), &mut seen);
+        }
+    }
+    seen.values()
+        .fold(0, |sum, bytes| sum.saturating_add(*bytes))
 }
 
 /// Bring a part's batches to one schema, so they can be sorted together.
@@ -630,13 +813,14 @@ fn canonicalize(part: Part, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
 /// read its absence: a `present.*` column as all false, anything else (a
 /// `property.*` column) as all null. A column name that means two data types,
 /// or appears twice in one batch, has no single sorted form and is refused.
-fn unify(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+/// Also returns the bytes of the columns it had to make.
+fn unify(batches: Vec<RecordBatch>) -> Result<(Vec<RecordBatch>, usize)> {
     let first = batches[0].schema();
     if batches
         .iter()
         .all(|b| b.schema().fields() == first.fields())
     {
-        return Ok(batches);
+        return Ok((batches, 0));
     }
     let mut fields: Vec<Field> = Vec::new();
     for batch in &batches {
@@ -678,24 +862,114 @@ fn unify(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
         }
     }
     let schema = Arc::new(Schema::new(fields));
-    batches
+    let mut filled = 0usize;
+    let batches = batches
         .into_iter()
         .map(|batch| {
             let rows = batch.num_rows();
             let columns = schema
                 .fields()
                 .iter()
-                .map(|field| match batch.column_by_name(field.name()) {
-                    Some(column) => column.clone(),
-                    None if field.name().starts_with("present.") => {
-                        Arc::new(BooleanArray::from(vec![false; rows])) as ArrayRef
-                    }
-                    None => new_null_array(field.data_type(), rows),
+                .map(|field| {
+                    let made = match batch.column_by_name(field.name()) {
+                        Some(column) => return column.clone(),
+                        None if field.name().starts_with("present.") => {
+                            Arc::new(BooleanArray::from(vec![false; rows])) as ArrayRef
+                        }
+                        None => new_null_array(field.data_type(), rows),
+                    };
+                    filled = filled.saturating_add(made.get_buffer_memory_size());
+                    made
                 })
                 .collect();
             Ok(RecordBatch::try_new(schema.clone(), columns)?)
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    Ok((batches, filled))
+}
+
+/// Bytes admitted from the memory budget, held as Grust reservation tokens
+/// and released when the last token drops. A part keeps the admissions for
+/// its rows beside them, so dropping the rows' owner — the part replaced, the
+/// graph dropped — returns their bytes. Cloning shares the tokens, and with
+/// them the charge: a byte is released once, when no clone holds it.
+#[derive(Clone, Debug, Default)]
+struct Admitted {
+    tokens: Vec<MemoryReservation>,
+    bytes: usize,
+}
+
+impl Admitted {
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn absorb(&mut self, other: Admitted) {
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.tokens.extend(other.tokens);
+    }
+}
+
+/// Admission from the memory budget on behalf of one graph, so a refusal can
+/// say which graph, what for, and how much. `part` is the part being staged,
+/// or `None` for the nodes a read derives from the edges.
+struct Budget<'a> {
+    pool: &'a ExecutionContext,
+    graph: &'a str,
+    part: Option<Part>,
+}
+
+impl Budget<'_> {
+    /// Admit `bytes` into `into` before they are allocated; refused when the
+    /// budget has no room, with `what` describing the need.
+    fn admit(
+        &self,
+        into: &mut Admitted,
+        bytes: usize,
+        what: impl FnOnce() -> String,
+    ) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        match self.pool.reserve(bytes) {
+            Ok(token) => {
+                into.bytes = into.bytes.saturating_add(bytes);
+                into.tokens.push(token);
+                Ok(())
+            }
+            Err(ProcedureError::BudgetExceeded { .. }) => Err(self.refused(&what())),
+            Err(other) => Err(err(other)),
+        }
+    }
+
+    /// Refuse now, before copying, when `bytes` would not fit what is free.
+    fn check(&self, bytes: usize, what: impl FnOnce() -> String) -> Result<()> {
+        match self.pool.check_memory_available(bytes) {
+            Ok(()) => Ok(()),
+            Err(ProcedureError::BudgetExceeded { .. }) => Err(self.refused(&what())),
+            Err(other) => Err(err(other)),
+        }
+    }
+
+    fn refused(&self, what: &str) -> DataFusionError {
+        let used = self.pool.usage().map_or(0, |u| u.live_bytes);
+        let (doing, outcome) = match self.part {
+            Some(part) => (
+                format!("staging its {}", part.name()),
+                "the write was refused and the graph is as it was",
+            ),
+            None => (
+                "reading it".to_string(),
+                "drop or restage a graph to release its rows and projections",
+            ),
+        };
+        DataFusionError::ResourcesExhausted(format!(
+            "nutmeg: graph `{}`: {doing} needs {what}, but {used} of the {}-byte memory budget \
+             are in use ({MEMORY_BYTES_VARIABLE}); {outcome}",
+            self.graph,
+            self.pool.limits().memory_bytes,
+        ))
+    }
 }
 
 /// One named graph: staged rows, and projections built from them.
@@ -703,6 +977,9 @@ fn unify(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
 struct Entry {
     nodes: Vec<RecordBatch>,
     edges: Vec<RecordBatch>,
+    /// The memory admitted for each part's rows, held as long as they are.
+    node_bytes: Admitted,
+    edge_bytes: Admitted,
     /// Whether the whole edges part is in canonical order, so the nodes
     /// derived from it (when no nodes are staged) are put in id order too.
     edges_canonical: bool,
@@ -716,11 +993,27 @@ pub struct GraphInfo {
     pub name: String,
     pub staged_nodes: usize,
     pub staged_edges: usize,
+    /// Bytes of the memory budget the staged rows hold: at least what they
+    /// keep alive ([`held_bytes`]), and for a sorted part at most its sort's
+    /// bound on the copy. Projections are not included; see [`MemoryInfo`].
+    pub staged_bytes: usize,
     pub revision: u64,
     pub projections: usize,
 }
 
-static GRAPHS: Lazy<RwLock<HashMap<String, Arc<RwLock<Entry>>>>> = Lazy::new(Default::default);
+/// What [`Registry::memory`] reports: the budget and what holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryInfo {
+    /// The budget, from `NUTMEG_MEMORY_BYTES` or [`set_memory_bytes`].
+    pub limit_bytes: usize,
+    /// Everything admitted now: staged rows, writes in progress, cached
+    /// projections and running kernels.
+    pub used_bytes: usize,
+    /// The part of `used_bytes` held by staged rows, summed over graphs.
+    pub staged_bytes: usize,
+    /// The most ever admitted at once.
+    pub peak_bytes: usize,
+}
 
 fn poisoned() -> DataFusionError {
     DataFusionError::Execution("nutmeg: registry lock poisoned".into())
@@ -733,30 +1026,88 @@ pub enum Part {
     Edges,
 }
 
-/// The process-wide registry of named graphs.
-pub struct Registry;
-
-impl Registry {
-    fn entry(name: &str, create: bool) -> Result<Option<Arc<RwLock<Entry>>>> {
-        if !create {
-            return Ok(GRAPHS.read().map_err(|_| poisoned())?.get(name).cloned());
+impl Part {
+    fn name(self) -> &'static str {
+        match self {
+            Part::Nodes => "nodes",
+            Part::Edges => "edges",
         }
-        let mut map = GRAPHS.write().map_err(|_| poisoned())?;
-        Ok(Some(map.entry(name.to_string()).or_default().clone()))
+    }
+}
+
+/// Named graphs and the one memory budget everything built for them is
+/// admitted from.
+///
+/// The budget is a Grust [`ExecutionContext`], so it is Grust's admission —
+/// exact under concurrency, released when a reservation token drops — that
+/// bounds staging too. Staged rows, each write's transient copies and its
+/// sort, every cached projection and every kernel run on one draw on it:
+/// projections are built with it as their context, and kernels run on a
+/// projection's context.
+struct Store {
+    graphs: RwLock<HashMap<String, Arc<RwLock<Entry>>>>,
+    pool: ExecutionContext,
+}
+
+static STORE: OnceCell<Store> = OnceCell::new();
+
+fn store() -> &'static Store {
+    STORE.get_or_init(|| Store::new(memory_bytes()))
+}
+
+impl Store {
+    fn new(memory_bytes: usize) -> Self {
+        let pool = ExecutionContext::new(ExecutionLimits {
+            memory_bytes,
+            work_units: usize::MAX,
+            batch_rows: 8192,
+            deadline: None,
+        })
+        .expect("a positive batch size is a valid execution");
+        Self {
+            graphs: Default::default(),
+            pool,
+        }
     }
 
-    /// Stage rows under `name`, renaming them into the grust-arrow layout.
-    /// `replace` discards that part's earlier rows. Nodes are optional: a
-    /// graph staged from edges alone takes its nodes from their endpoints.
-    /// Returns the rows now staged for that part.
-    ///
-    /// Under [`StageOrder::Canonical`] the whole part — earlier rows kept by
-    /// an append, and these — is sorted afterwards, so the part is the same
-    /// whatever order its rows and its appends arrived in. Under
-    /// [`StageOrder::AsStaged`] these rows are added after the earlier ones in
-    /// the order given, and the part is no longer canonical until a canonical
-    /// write sorts it again.
-    pub fn stage(
+    fn entry(&self, name: &str) -> Result<Option<Arc<RwLock<Entry>>>> {
+        Ok(self
+            .graphs
+            .read()
+            .map_err(|_| poisoned())?
+            .get(name)
+            .cloned())
+    }
+
+    fn existing(&self, name: &str) -> Result<Arc<RwLock<Entry>>> {
+        match self.entry(name)? {
+            Some(entry) => Ok(entry),
+            None => exec_err!("nutmeg: no graph named `{name}`; stage its rows first"),
+        }
+    }
+
+    fn staging(
+        &self,
+        name: &str,
+        part: Part,
+        mapping: &ColumnMapping,
+        replace: bool,
+        order: StageOrder,
+    ) -> Staging<'_> {
+        Staging {
+            store: self,
+            graph: name.to_string(),
+            part,
+            mapping: mapping.clone(),
+            replace,
+            order,
+            normalized: Vec::new(),
+            fresh: Admitted::default(),
+        }
+    }
+
+    fn stage(
+        &self,
         name: &str,
         part: Part,
         batches: &[RecordBatch],
@@ -764,49 +1115,24 @@ impl Registry {
         replace: bool,
         order: StageOrder,
     ) -> Result<usize> {
-        let normalized: Vec<RecordBatch> = batches
-            .iter()
-            .filter(|b| b.num_rows() > 0)
-            .map(|b| match part {
-                Part::Nodes => normalize_nodes(b, mapping),
-                Part::Edges => normalize_edges(b, mapping),
-            })
-            .collect::<Result<_>>()?;
-        let entry = Self::entry(name, true)?.expect("created");
-        let mut e = entry.write().map_err(|_| poisoned())?;
-        let rows = match part {
-            Part::Nodes => &mut e.nodes,
-            Part::Edges => &mut e.edges,
-        };
-        // Built aside and swapped in, so a write the sort refuses leaves the
-        // staged rows as they were. Cloning batches clones only their handles.
-        let mut staged = if replace { Vec::new() } else { rows.clone() };
-        staged.extend(normalized);
-        let canonical = order == StageOrder::Canonical;
-        if canonical {
-            staged = canonicalize(part, staged)?;
+        let mut staging = self.staging(name, part, mapping, replace, order);
+        for batch in batches {
+            staging.push(batch)?;
         }
-        *rows = staged;
-        let total = rows.iter().map(|b| b.num_rows()).sum();
-        if part == Part::Edges {
-            e.edges_canonical = canonical;
-        }
-        e.revision += 1;
-        e.projections.clear();
-        Ok(total)
+        staging.finish()
     }
 
-    /// Forget `name` and everything built from it.
-    pub fn drop(name: &str) -> Result<bool> {
-        Ok(GRAPHS
+    fn drop(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .graphs
             .write()
             .map_err(|_| poisoned())?
             .remove(name)
             .is_some())
     }
 
-    pub fn list() -> Result<Vec<GraphInfo>> {
-        let map = GRAPHS.read().map_err(|_| poisoned())?;
+    fn list(&self) -> Result<Vec<GraphInfo>> {
+        let map = self.graphs.read().map_err(|_| poisoned())?;
         let mut out = Vec::new();
         for (name, entry) in map.iter() {
             let e = entry.read().map_err(|_| poisoned())?;
@@ -814,6 +1140,7 @@ impl Registry {
                 name: name.clone(),
                 staged_nodes: e.nodes.iter().map(|b| b.num_rows()).sum(),
                 staged_edges: e.edges.iter().map(|b| b.num_rows()).sum(),
+                staged_bytes: e.node_bytes.bytes() + e.edge_bytes.bytes(),
                 revision: e.revision,
                 projections: e.projections.len(),
             });
@@ -822,42 +1149,58 @@ impl Registry {
         Ok(out)
     }
 
-    fn staged_counts(name: &str) -> Result<(usize, usize)> {
-        let Some(entry) = Self::entry(name, false)? else {
-            return exec_err!("nutmeg: no graph named `{name}`; stage its rows first");
+    fn memory(&self) -> Result<MemoryInfo> {
+        let staged_bytes = self.list()?.iter().map(|g| g.staged_bytes).sum();
+        let usage = self.pool.usage().map_err(err)?;
+        Ok(MemoryInfo {
+            limit_bytes: self.pool.limits().memory_bytes,
+            used_bytes: usage.live_bytes,
+            staged_bytes,
+            peak_bytes: usage.peak_bytes,
+        })
+    }
+
+    /// The nodes of `e` when none were staged, derived from its edges, with
+    /// the memory they take admitted before they are made.
+    fn derived_nodes(&self, name: &str, e: &Entry) -> Result<(RecordBatch, Admitted)> {
+        let budget = Budget {
+            pool: &self.pool,
+            graph: name,
+            part: None,
         };
+        let bound = derive_nodes_bound(&e.edges);
+        let mut admitted = Admitted::default();
+        budget.admit(&mut admitted, bound, || {
+            format!("{bound} bytes to derive its nodes from its edges")
+        })?;
+        Ok((derive_nodes(&e.edges, e.edges_canonical)?, admitted))
+    }
+
+    fn staged_counts(&self, name: &str) -> Result<(usize, usize)> {
+        let entry = self.existing(name)?;
         let e = entry.read().map_err(|_| poisoned())?;
         let edges: usize = e.edges.iter().map(|b| b.num_rows()).sum();
         let nodes = if e.nodes.is_empty() {
-            derive_nodes(&e.edges, e.edges_canonical)?.num_rows()
+            self.derived_nodes(name, &e)?.0.num_rows()
         } else {
             e.nodes.iter().map(|b| b.num_rows()).sum()
         };
         Ok((nodes, edges))
     }
 
-    /// The projection of `name` under the projection options in `args`,
-    /// built on first use and kept until the graph is staged again.
-    /// The node batches a projection of `name` is built from: those staged,
-    /// or, when only edges were staged, the endpoints derived from them. A
-    /// kernel's node properties are read from these, row-aligned with the
-    /// projection by node id.
-    fn node_batches(name: &str) -> Result<Vec<RecordBatch>> {
-        let Some(entry) = Self::entry(name, false)? else {
-            return exec_err!("nutmeg: no graph named `{name}`; stage its rows first");
-        };
+    fn node_batches(&self, name: &str) -> Result<(Vec<RecordBatch>, Admitted)> {
+        let entry = self.existing(name)?;
         let e = entry.read().map_err(|_| poisoned())?;
         if e.nodes.is_empty() {
-            Ok(vec![derive_nodes(&e.edges, e.edges_canonical)?])
+            let (nodes, admitted) = self.derived_nodes(name, &e)?;
+            Ok((vec![nodes], admitted))
         } else {
-            Ok(e.nodes.clone())
+            Ok((e.nodes.clone(), Admitted::default()))
         }
     }
 
-    pub fn projection(name: &str, args: &ValidatedArguments) -> Result<GraphProjection> {
-        let Some(entry) = Self::entry(name, false)? else {
-            return exec_err!("nutmeg: no graph named `{name}`; stage its rows first");
-        };
+    fn projection(&self, name: &str, args: &ValidatedArguments) -> Result<GraphProjection> {
+        let entry = self.existing(name)?;
         let key = projection_key(args);
         if let Some(found) = entry.read().map_err(|_| poisoned())?.projections.get(&key) {
             return Ok(found.clone());
@@ -868,44 +1211,294 @@ impl Registry {
         }
         let derived;
         let nodes: &[RecordBatch] = if e.nodes.is_empty() {
-            derived = [derive_nodes(&e.edges, e.edges_canonical)?];
-            &derived
+            derived = self.derived_nodes(name, &e)?;
+            std::slice::from_ref(&derived.0)
         } else {
             &e.nodes
         };
-        let context = ExecutionContext::new(ExecutionLimits {
-            memory_bytes: memory_bytes(),
-            work_units: usize::MAX,
-            batch_rows: 8192,
-            deadline: None,
-        })
-        .map_err(err)?;
         let identity = SnapshotIdentity::new(
             name.to_string(),
             format!("r{}", e.revision),
             "nutmeg".into(),
         )
         .map_err(err)?;
+        // Built in the budget's own context: its reservations, and those of
+        // every kernel later run on it, are admitted from the one budget.
         let graph = GraphProjection::from_arrow_batches(
             identity,
             nodes,
             &e.edges,
             projection_options(args)?,
-            &context,
+            &self.pool,
         )
-        .map_err(err)?;
+        .map_err(|error| match error {
+            ProcedureError::BudgetExceeded {
+                resource: "memory",
+                limit,
+            } => {
+                let used = self.pool.usage().map_or(0, |u| u.live_bytes);
+                DataFusionError::ResourcesExhausted(format!(
+                    "nutmeg: graph `{name}`: its projection does not fit: {used} of the \
+                     {limit}-byte memory budget are in use ({MEMORY_BYTES_VARIABLE}); drop or \
+                     restage a graph to release its rows and projections"
+                ))
+            }
+            other => err(other),
+        })?;
         e.projections.insert(key, graph.clone());
         Ok(graph)
     }
+}
+
+/// One write to one part of one graph, fed a batch at a time.
+///
+/// Each batch is renamed into the grust-arrow layout as it arrives, and the
+/// memory the renamed rows keep is admitted as they are made, so a write
+/// larger than the budget is refused at the batch that would cross it rather
+/// than after all of it has been collected. [`Staging::finish`] then admits
+/// the sort's working space, builds the new part aside and swaps it in.
+/// Until then the graph is untouched; a write refused or abandoned at any
+/// point leaves it exactly as it was, and releases what it had admitted.
+pub struct Staging<'a> {
+    store: &'a Store,
+    graph: String,
+    part: Part,
+    mapping: ColumnMapping,
+    replace: bool,
+    order: StageOrder,
+    normalized: Vec<RecordBatch>,
+    /// Admitted for `normalized`.
+    fresh: Admitted,
+}
+
+impl Staging<'_> {
+    fn budget(&self) -> Budget<'_> {
+        Budget {
+            pool: &self.store.pool,
+            graph: &self.graph,
+            part: Some(self.part),
+        }
+    }
+
+    /// Rename one batch and admit the memory it keeps.
+    pub fn push(&mut self, batch: &RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        // Before copying: the rows themselves must fit what is free. Renaming
+        // shares or copies them, so this refuses a batch that plainly cannot
+        // fit before it is copied.
+        let incoming: usize = batch
+            .columns()
+            .iter()
+            .map(|c| slice_bytes(c.as_ref()))
+            .sum();
+        let rows = batch.num_rows();
+        let budget = Budget {
+            pool: &self.store.pool,
+            graph: &self.graph,
+            part: Some(self.part),
+        };
+        budget.check(incoming, || {
+            format!("at least {incoming} bytes for {rows} more rows")
+        })?;
+        let normalized = match self.part {
+            Part::Nodes => normalize_nodes(batch, &self.mapping)?,
+            Part::Edges => normalize_edges(batch, &self.mapping)?,
+        };
+        // What the renamed rows keep alive: columns copied by a cast, and the
+        // caller's buffers where a column is shared unchanged.
+        let held = held_bytes(std::slice::from_ref(&normalized));
+        budget.admit(&mut self.fresh, held, || {
+            format!("{held} bytes for {rows} more rows")
+        })?;
+        self.normalized.push(normalized);
+        Ok(())
+    }
+
+    /// Swap the write into the graph, creating the graph if it is new.
+    /// Returns the rows now staged for that part.
+    ///
+    /// Under [`StageOrder::Canonical`] the whole part — earlier rows kept by
+    /// an append, and these — is sorted afterwards, so the part is the same
+    /// whatever order its rows and its appends arrived in. Under
+    /// [`StageOrder::AsStaged`] these rows are added after the earlier ones in
+    /// the order given, and the part is no longer canonical until a canonical
+    /// write sorts it again.
+    pub fn finish(self) -> Result<usize> {
+        let store = self.store;
+        let (entry, created) = {
+            let mut map = store.graphs.write().map_err(|_| poisoned())?;
+            match map.get(&self.graph) {
+                Some(entry) => (entry.clone(), false),
+                None => {
+                    let entry = Arc::new(RwLock::new(Entry::default()));
+                    map.insert(self.graph.clone(), entry.clone());
+                    (entry, true)
+                }
+            }
+        };
+        let result = self.swap_into(&entry);
+        if result.is_err() && created {
+            // A refused write to a new graph leaves no graph behind, unless
+            // another write has staged into it meanwhile.
+            let mut map = store.graphs.write().map_err(|_| poisoned())?;
+            let untouched = map.get(&self.graph).is_some_and(|found| {
+                Arc::ptr_eq(found, &entry) && found.read().is_ok_and(|e| e.revision == 0)
+            });
+            if untouched {
+                map.remove(&self.graph);
+            }
+        }
+        result
+    }
+
+    fn swap_into(&self, entry: &RwLock<Entry>) -> Result<usize> {
+        let mut e = entry.write().map_err(|_| poisoned())?;
+        let (rows, admitted) = match self.part {
+            Part::Nodes => (&e.nodes, &e.node_bytes),
+            Part::Edges => (&e.edges, &e.edge_bytes),
+        };
+        // Built aside and swapped in, so a write the budget or the sort
+        // refuses leaves the staged rows as they were. Cloning batches clones
+        // only their handles, and cloning admissions shares their tokens.
+        let mut staged = if self.replace {
+            Vec::new()
+        } else {
+            rows.clone()
+        };
+        staged.extend(self.normalized.iter().cloned());
+        let canonical = self.order == StageOrder::Canonical;
+        let (staged, held) = if canonical {
+            canonicalize(self.part, staged, &self.budget())?
+        } else {
+            let mut held = if self.replace {
+                Admitted::default()
+            } else {
+                admitted.clone()
+            };
+            held.absorb(self.fresh.clone());
+            (staged, held)
+        };
+        let total = staged.iter().map(|b| b.num_rows()).sum();
+        match self.part {
+            Part::Nodes => {
+                e.nodes = staged;
+                e.node_bytes = held;
+            }
+            Part::Edges => {
+                e.edges = staged;
+                e.edge_bytes = held;
+                e.edges_canonical = canonical;
+            }
+        }
+        e.revision += 1;
+        e.projections.clear();
+        Ok(total)
+    }
+}
+
+/// The process-wide registry of named graphs.
+pub struct Registry;
+
+impl Registry {
+    #[cfg(test)]
+    fn entry(name: &str) -> Result<Option<Arc<RwLock<Entry>>>> {
+        store().entry(name)
+    }
+
+    /// Stage rows under `name`, renaming them into the grust-arrow layout.
+    /// `replace` discards that part's earlier rows. Nodes are optional: a
+    /// graph staged from edges alone takes its nodes from their endpoints.
+    /// Returns the rows now staged for that part. See [`Staging`] for how the
+    /// write is admitted and [`Staging::finish`] for `order`.
+    pub fn stage(
+        name: &str,
+        part: Part,
+        batches: &[RecordBatch],
+        mapping: &ColumnMapping,
+        replace: bool,
+        order: StageOrder,
+    ) -> Result<usize> {
+        store().stage(name, part, batches, mapping, replace, order)
+    }
+
+    /// Begin a write that is fed a batch at a time, so the caller need not
+    /// collect a whole DataFrame before the budget can refuse it.
+    pub fn staging(
+        name: &str,
+        part: Part,
+        mapping: &ColumnMapping,
+        replace: bool,
+        order: StageOrder,
+    ) -> Staging<'static> {
+        store().staging(name, part, mapping, replace, order)
+    }
+
+    /// Forget `name` and everything built from it, releasing its memory once
+    /// no read still running on it holds its rows or a projection.
+    pub fn drop(name: &str) -> Result<bool> {
+        store().drop(name)
+    }
+
+    pub fn list() -> Result<Vec<GraphInfo>> {
+        store().list()
+    }
+
+    /// The memory budget and what is using it.
+    pub fn memory() -> Result<MemoryInfo> {
+        store().memory()
+    }
+
+    fn staged_counts(name: &str) -> Result<(usize, usize)> {
+        store().staged_counts(name)
+    }
+
+    /// The node batches a projection of `name` is built from: those staged,
+    /// or, when only edges were staged, the endpoints derived from them. A
+    /// kernel's node properties are read from these, row-aligned with the
+    /// projection by node id. The admission for derived nodes comes with
+    /// them; hold it as long as they are used.
+    fn node_batches(name: &str) -> Result<(Vec<RecordBatch>, Admitted)> {
+        store().node_batches(name)
+    }
+
+    /// The projection of `name` under the projection options in `args`,
+    /// built on first use and kept until the graph is staged again.
+    pub fn projection(name: &str, args: &ValidatedArguments) -> Result<GraphProjection> {
+        store().projection(name, args)
+    }
+}
+
+/// An upper bound on the memory [`derive_nodes`] takes for `edges`: per
+/// endpoint an entry of its sort and at most an id offset and a label offset;
+/// the id text at most once; and the buffers' rounding.
+fn derive_nodes_bound(edges: &[RecordBatch]) -> usize {
+    let per_endpoint = size_of::<(&str, usize)>() + 2 * size_of::<i32>();
+    let mut bound = 1024usize;
+    for batch in edges {
+        bound = bound.saturating_add(batch.num_rows().saturating_mul(2 * per_endpoint));
+        for name in ["source", "target"] {
+            if let Some(column) = batch.column_by_name(name) {
+                bound = bound.saturating_add(slice_bytes(column.as_ref()));
+            }
+        }
+    }
+    bound
 }
 
 /// Distinct edge endpoints as a node batch: in id order when the edges are
 /// canonical, so a graph staged from edges alone projects its nodes in the
 /// order the same nodes staged explicitly would take; otherwise in the order
 /// they first appear among the edges.
+///
+/// Found by sorting the endpoints, not with a hash set, so the memory it takes
+/// is known before it starts ([`derive_nodes_bound`]): one vector sized to the
+/// endpoints, and the id column built to its exact size.
 fn derive_nodes(edges: &[RecordBatch], sorted: bool) -> Result<RecordBatch> {
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut ids: Vec<&str> = Vec::new();
+    let endpoints: usize = edges.iter().map(|b| 2 * b.num_rows()).sum();
+    // (id, position of its first appearance)
+    let mut seen: Vec<(&str, usize)> = Vec::with_capacity(endpoints);
     for batch in edges {
         let column = |name: &str| {
             batch
@@ -919,20 +1512,31 @@ fn derive_nodes(edges: &[RecordBatch], sorted: bool) -> Result<RecordBatch> {
                 if endpoint.is_null(row) {
                     return exec_err!("nutmeg: null edge endpoint at row {row}");
                 }
-                let id = endpoint.value(row);
-                if seen.insert(id) {
-                    ids.push(id);
-                }
+                seen.push((endpoint.value(row), seen.len()));
             }
         }
     }
-    if sorted {
-        ids.sort_unstable();
+    // By id, then position, so the first of each id is where it first appears.
+    seen.sort_unstable();
+    seen.dedup_by(|later, first| later.0 == first.0);
+    if !sorted {
+        seen.sort_unstable_by_key(|(_, position)| *position);
     }
-    let rows = ids.len();
+    let rows = seen.len();
+    let text = seen.iter().map(|(id, _)| id.len()).sum();
+    let mut ids = StringBuilder::with_capacity(rows, text);
+    for (id, _) in &seen {
+        ids.append_value(id);
+    }
+    drop(seen);
+    let labels = StringArray::new(
+        OffsetBuffer::new_zeroed(rows),
+        Buffer::from(Vec::<u8>::new()),
+        None,
+    );
     Ok(RecordBatch::try_new(
         node_schema(),
-        vec![Arc::new(StringArray::from(ids)), constant("", rows)],
+        vec![Arc::new(ids.finish()), Arc::new(labels)],
     )?)
 }
 
@@ -1198,7 +1802,7 @@ fn run_kernel(
             if wanted.is_empty() {
                 grust_algorithm_procedures::run_on_projection(algorithm, g, args).map_err(err)?
             } else {
-                let nodes = Registry::node_batches(graph_name)?;
+                let (nodes, _derived) = Registry::node_batches(graph_name)?;
                 let properties =
                     NodeProperties::from_arrow_batches(&nodes, g, &wanted).map_err(err)?;
                 grust_algorithm_procedures::run_with_properties(algorithm, &properties, args)
@@ -1355,7 +1959,7 @@ pub fn output_schema(algorithm: &str) -> Result<SchemaRef> {
         return Ok(found.clone());
     }
     let mut schemas = SCHEMAS.write().map_err(|_| poisoned())?;
-    if Registry::entry(PROBE, false)?.is_none() {
+    if store().entry(PROBE)?.is_none() {
         let edges = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("source", DataType::Utf8, false),
@@ -1465,6 +2069,7 @@ impl GraphsTable {
             Field::new("name", DataType::Utf8, false),
             Field::new("stagedNodes", DataType::Int64, false),
             Field::new("stagedEdges", DataType::Int64, false),
+            Field::new("stagedBytes", DataType::Int64, false),
             Field::new("revision", DataType::Int64, false),
             Field::new("projections", DataType::Int64, false),
         ]))
@@ -1488,10 +2093,64 @@ impl GraphsTable {
                 )),
                 ints(|g| g.staged_nodes),
                 ints(|g| g.staged_edges),
+                ints(|g| g.staged_bytes),
                 ints(|g| g.revision as usize),
                 ints(|g| g.projections),
             ],
         )?])
+    }
+}
+
+/// The memory budget and what is using it, as one row: `limitBytes`,
+/// `usedBytes` (staged rows, writes in progress, cached projections and
+/// running kernels), `stagedBytes` (the staged rows alone, the sum of the
+/// graph listing's `stagedBytes`) and `peakBytes`.
+#[derive(Debug)]
+pub struct MemoryTable;
+
+impl MemoryTable {
+    pub fn arrow_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("limitBytes", DataType::Int64, false),
+            Field::new("usedBytes", DataType::Int64, false),
+            Field::new("stagedBytes", DataType::Int64, false),
+            Field::new("peakBytes", DataType::Int64, false),
+        ]))
+    }
+
+    pub fn batches() -> Result<Vec<RecordBatch>> {
+        let m = Registry::memory()?;
+        let int = |v: usize| Arc::new(Int64Array::from(vec![v as i64])) as ArrayRef;
+        Ok(vec![RecordBatch::try_new(
+            Self::arrow_schema(),
+            vec![
+                int(m.limit_bytes),
+                int(m.used_bytes),
+                int(m.staged_bytes),
+                int(m.peak_bytes),
+            ],
+        )?])
+    }
+}
+
+#[async_trait]
+impl TableProvider for MemoryTable {
+    fn schema(&self) -> SchemaRef {
+        Self::arrow_schema()
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Temporary
+    }
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        MemTable::try_new(Self::arrow_schema(), vec![Self::batches()?])?
+            .scan(state, projection, filters, limit)
+            .await
     }
 }
 
@@ -1598,7 +2257,21 @@ impl TableFunctionImpl for GraphsFunction {
     }
 }
 
-/// One table function per Grust algorithm, plus `nutmeg_graphs`.
+/// `nutmeg_memory()`.
+#[derive(Debug)]
+struct MemoryFunction;
+
+impl TableFunctionImpl for MemoryFunction {
+    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        if !args.is_empty() {
+            return plan_err!("nutmeg_memory() takes no arguments");
+        }
+        Ok(Arc::new(MemoryTable))
+    }
+}
+
+/// One table function per Grust algorithm, plus `nutmeg_graphs` and
+/// `nutmeg_memory`.
 pub fn table_functions() -> Vec<(String, Arc<TableFunction>)> {
     let mut out: Vec<(String, Arc<TableFunction>)> = algorithm_names()
         .into_iter()
@@ -1615,6 +2288,13 @@ pub fn table_functions() -> Vec<(String, Arc<TableFunction>)> {
         Arc::new(TableFunction::new(
             "nutmeg_graphs".into(),
             Arc::new(GraphsFunction),
+        )),
+    ));
+    out.push((
+        "nutmeg_memory".into(),
+        Arc::new(TableFunction::new(
+            "nutmeg_memory".into(),
+            Arc::new(MemoryFunction),
         )),
     ));
     out

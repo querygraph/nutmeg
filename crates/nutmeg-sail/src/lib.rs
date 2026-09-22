@@ -262,18 +262,23 @@ impl DataSink for StageWriter {
 
     async fn write_all(
         &self,
-        data: SendableRecordBatchStream,
+        mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        let batches: Vec<_> = data.try_collect().await?;
-        let rows = Registry::stage(
+        // Fed a batch at a time, so Nutmeg's memory budget can refuse a write
+        // at the batch that would cross it, instead of after the whole
+        // DataFrame has been collected here.
+        let mut staging = Registry::staging(
             &self.graph,
             self.part,
-            &batches,
             &self.mapping,
             self.replace,
             self.order,
-        )?;
+        );
+        while let Some(batch) = data.try_next().await? {
+            staging.push(&batch)?;
+        }
+        let rows = staging.finish()?;
         Ok(rows as u64)
     }
 }
