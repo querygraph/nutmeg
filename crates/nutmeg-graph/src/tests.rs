@@ -505,11 +505,13 @@ fn gds_aliases_name_declared_columns_and_never_collide() {
             .map(|o| &o.field)
             .chain(definition.arguments.iter().map(|a| &a.field))
         {
-            assert!(
-                !field.name.eq_ignore_ascii_case(COLUMN_NAMES_OPTION),
-                "{name} declares `{}`, which Nutmeg takes for itself",
-                field.name
-            );
+            for taken in std::iter::once(COLUMN_NAMES_OPTION).chain(QUERY_OPTIONS) {
+                assert!(
+                    !field.name.eq_ignore_ascii_case(taken),
+                    "{name} declares `{}`, which Nutmeg takes for itself",
+                    field.name
+                );
+            }
         }
     }
 }
@@ -530,6 +532,7 @@ fn every_algorithm_reports_the_columns_its_scan_returns_under_either_naming() {
                 graph: PROBE.to_string(),
                 args: args.clone(),
                 names,
+                limits: QueryLimits::default(),
                 schema: output_schema_named(name, names).unwrap(),
             };
             let batches = table
@@ -1819,8 +1822,8 @@ fn the_sorts_working_space_is_admitted_before_the_sort() {
         as_staged_held
     );
 
-    // What a part is charged covers what it keeps alive, and for a sorted
-    // part exceeds it by no more than the bound's rounding.
+    // What a sorted part is charged is what it keeps alive: the bound its
+    // copy was admitted under is shrunk to the copy's size once made.
     let sorted = Store::new(usize::MAX);
     sorted
         .stage(
@@ -1834,11 +1837,7 @@ fn the_sorts_working_space_is_admitted_before_the_sort() {
         .unwrap();
     let held = held_bytes(&part_of(&sorted, "s"));
     assert_eq!(info_of(&sorted, "s").unwrap().staged_bytes, canonical_held);
-    assert!(canonical_held >= held, "{canonical_held} < {held}");
-    assert!(
-        canonical_held - held < held / 10,
-        "charged {canonical_held} for {held}"
-    );
+    assert_eq!(canonical_held, held);
 }
 
 /// Bytes are measured as the allocations the rows keep alive: a slice keeps
@@ -2171,4 +2170,414 @@ fn concurrent_writes_to_different_graphs_never_exceed_the_budget() {
     assert!(memory.peak_bytes <= limit, "{memory:?}");
     assert_eq!(memory.used_bytes, 0, "every byte was returned: {memory:?}");
     assert!(most_held.into_inner() <= limit);
+}
+
+/// A sorted part is charged what its copy keeps alive, not the bound the copy
+/// was admitted under: the bound is shrunk once the copy is made, and the
+/// budget shows the real size. The peak keeps the bound, which was admitted.
+#[test]
+fn a_sorted_part_returns_what_its_bound_overestimated() {
+    let batch = budget_edges(0, 5_000);
+    let store = Store::new(usize::MAX);
+    store
+        .stage(
+            "shrunk",
+            Part::Edges,
+            std::slice::from_ref(&batch),
+            &ColumnMapping::default(),
+            true,
+            StageOrder::Canonical,
+        )
+        .unwrap();
+    let part = part_of(&store, "shrunk");
+    let held = held_bytes(&part);
+    let bound = sorted_copy_bound(&part);
+    assert!(
+        bound > held,
+        "the bound {bound} would return nothing of {held}"
+    );
+    eprintln!(
+        "sorted copy: bound {bound}, held {held}, returned {}",
+        bound - held
+    );
+    let entry = store.entry("shrunk").unwrap().unwrap();
+    assert_eq!(entry.read().unwrap().edge_bytes.bytes(), held);
+    let memory = store.memory().unwrap();
+    assert_eq!(memory.used_bytes, held, "{memory:?}");
+    assert_eq!(memory.staged_bytes, held, "{memory:?}");
+    assert!(memory.peak_bytes >= bound, "{memory:?}");
+    drop((part, entry));
+    assert!(store.drop("shrunk").unwrap());
+    assert_eq!(store.memory().unwrap().used_bytes, 0);
+}
+
+/// A directed graph of `nodes` nodes with between one and `degree` out-edges
+/// each, staged as `name`. Degrees in and out vary from node to node, so the
+/// uniform ranks are not PageRank's fixed point and [`pagerank_for`] runs
+/// every iteration it is given rather than converging at once, as it does on
+/// a regular graph.
+fn stage_read_graph(store: &Store, name: &str, nodes: usize, degree: usize) {
+    let mut source = Vec::with_capacity(nodes * degree);
+    let mut target = Vec::with_capacity(nodes * degree);
+    for i in 0..nodes {
+        for j in 0..1 + i % degree {
+            source.push(format!("n{i:06}"));
+            target.push(format!(
+                "n{:06}",
+                (i * i * 31 + j * 7_919 + i / 7 + 1) % nodes
+            ));
+        }
+    }
+    let source: Vec<&str> = source.iter().map(String::as_str).collect();
+    let target: Vec<&str> = target.iter().map(String::as_str).collect();
+    store
+        .stage(
+            name,
+            Part::Edges,
+            &[edges(&source, &target, None)],
+            &ColumnMapping::default(),
+            true,
+            StageOrder::Canonical,
+        )
+        .unwrap();
+}
+
+/// PageRank for `iterations` iterations. A tolerance of zero stops early only
+/// at an exact fixed point, and a damping near one makes that tens of
+/// thousands of iterations away on [`stage_read_graph`]'s graphs, so the
+/// iterations are the work. [`iterations_run`] checks it.
+fn pagerank_for(iterations: usize) -> ValidatedArguments {
+    let options = serde_json::json!({
+        "tolerance": 0.0,
+        "damping": 0.999,
+        "maxIterations": iterations,
+    });
+    validate("pagerank", options.as_object().unwrap()).unwrap()
+}
+
+/// The iterations a PageRank result ran.
+fn iterations_run(batches: &[RecordBatch]) -> i64 {
+    batches[0]
+        .column_by_name("iterations")
+        .unwrap()
+        .as_primitive::<arrow::datatypes::Int64Type>()
+        .value(0)
+}
+
+fn work_of(query: &Query) -> usize {
+    query.usage().unwrap().counted_work().unwrap_or(0)
+}
+
+const READ_NODES: usize = 20_000;
+const READ_DEGREE: usize = 8;
+/// The sibling's iterations: long enough to be still running when the
+/// victim, started beside it, is cancelled.
+const SIBLING_ITERATIONS: usize = 100;
+/// The victim's: bounded, so that a victim that cannot be stopped fails the
+/// test by finishing rather than hanging it.
+const VICTIM_ITERATIONS: usize = 20 * SIBLING_ITERATIONS;
+
+/// One round: two reads of one cached graph at once, the victim cancelled
+/// once both are running. Returns whether the sibling was still running when
+/// the victim was cancelled.
+fn cancel_one_of_two(store: &Store, name: &str, lone: &[RecordBatch]) -> bool {
+    let victim = store.query(QueryLimits::default()).unwrap();
+    let sibling = store.query(QueryLimits::default()).unwrap();
+    let (victim_args, sibling_args) = (
+        pagerank_for(VICTIM_ITERATIONS),
+        pagerank_for(SIBLING_ITERATIONS),
+    );
+    let sibling_done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let v = scope.spawn(|| store.run(&victim, "pagerank", name, &victim_args));
+        let s = scope.spawn(|| {
+            let result = store.run(&sibling, "pagerank", name, &sibling_args);
+            sibling_done.store(true, Ordering::Release);
+            result
+        });
+        // Each has charged work of its own once its kernel is running.
+        while (work_of(&victim) == 0 || work_of(&sibling) == 0)
+            && !v.is_finished()
+            && !s.is_finished()
+        {
+            std::thread::yield_now();
+        }
+        let overlapped = !sibling_done.load(Ordering::Acquire);
+        victim.cancel().unwrap();
+        let stopped = v.join().unwrap();
+        let finished = s.join().unwrap();
+        let error = stopped
+            .expect_err("the cancelled read was stopped")
+            .to_string();
+        assert!(error.contains("cancelled"), "{error}");
+        assert_eq!(finished.expect("the sibling finished"), lone);
+        store.pool.checkpoint().expect("the pool is not cancelled");
+        sibling
+            .context
+            .checkpoint()
+            .expect("the sibling is not cancelled");
+        overlapped
+    })
+}
+
+/// Two reads run at once on one cached projection, each on its own child of
+/// the pool. Cancelling one mid-run stops it alone: the other finishes with
+/// the result a lone read gives, and neither it nor the pool is cancelled.
+/// Every byte either read took is back afterwards. `NUTMEG_CANCEL_ROUNDS`
+/// (3 by default) repeats it, for stress runs.
+#[test]
+fn cancelling_one_read_leaves_a_concurrent_read_and_the_pool_running() {
+    let rounds: usize = std::env::var("NUTMEG_CANCEL_ROUNDS")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(3);
+    let store = Store::new(usize::MAX);
+    let name = "cancelled";
+    stage_read_graph(&store, name, READ_NODES, READ_DEGREE);
+    // A lone read builds and caches the projection and its transpose, both
+    // the pool's; the rounds then run on the cached graph.
+    let lone = store
+        .run(
+            &store.query(QueryLimits::default()).unwrap(),
+            "pagerank",
+            name,
+            &pagerank_for(SIBLING_ITERATIONS),
+        )
+        .unwrap();
+    assert_eq!(iterations_run(&lone), SIBLING_ITERATIONS as i64);
+    let baseline = store.memory().unwrap().used_bytes;
+    let mut overlapped = 0;
+    for _ in 0..rounds {
+        overlapped += usize::from(cancel_one_of_two(&store, name, &lone));
+        assert_eq!(store.memory().unwrap().used_bytes, baseline);
+    }
+    eprintln!("cancel isolation: {rounds} rounds, sibling still running at {overlapped}");
+    assert!(overlapped > 0, "the sibling never ran beside the victim");
+    // A read after all of that runs as the first did.
+    let after = store
+        .run(
+            &store.query(QueryLimits::default()).unwrap(),
+            "pagerank",
+            name,
+            &pagerank_for(SIBLING_ITERATIONS),
+        )
+        .unwrap();
+    assert_eq!(after, lone);
+}
+
+/// Reads draw on the one budget: however many run at once, what they hold
+/// with the staged rows and the cached projection never exceeds
+/// `NUTMEG_MEMORY_BYTES`. A read that does not fit is refused, and every
+/// read that fits returns what a lone read does.
+#[test]
+fn concurrent_reads_never_exceed_the_budget_together() {
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 30;
+    let name = "shared-budget";
+    let args = pagerank_for(20);
+    // Measured on a budget that cannot refuse: what the graph holds with
+    // its projection and transpose built, and what one read holds at most.
+    let measure = Store::new(usize::MAX);
+    stage_read_graph(&measure, name, 3_000, 4);
+    let query = measure.query(QueryLimits::default()).unwrap();
+    let lone = measure.run(&query, "pagerank", name, &args).unwrap();
+    let baseline = measure.memory().unwrap().used_bytes;
+    let per_read = query.usage().unwrap().peak_bytes;
+    assert!(per_read > 0);
+    drop(query);
+    // Room for the graph and two and a half reads, and for building it.
+    let limit = (baseline + 2 * per_read + per_read / 2).max(measure.memory().unwrap().peak_bytes);
+    let store = Store::new(limit);
+    stage_read_graph(&store, name, 3_000, 4);
+    let first = store
+        .run(
+            &store.query(QueryLimits::default()).unwrap(),
+            "pagerank",
+            name,
+            &args,
+        )
+        .unwrap();
+    assert_eq!(first, lone);
+    assert_eq!(store.memory().unwrap().used_bytes, baseline);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let (admitted, refused) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        let monitor = scope.spawn(|| {
+            let mut samples = 0usize;
+            while !done.load(Ordering::Acquire) {
+                let used = store.memory().unwrap().used_bytes;
+                assert!(used <= limit, "{used} of {limit}");
+                samples += 1;
+                std::thread::yield_now();
+            }
+            samples
+        });
+        let readers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (store, args, lone) = (&store, &args, &lone);
+                let (admitted, refused) = (&admitted, &refused);
+                scope.spawn(move || {
+                    for _ in 0..ROUNDS {
+                        let query = store.query(QueryLimits::default()).unwrap();
+                        match store.run(&query, "pagerank", name, args) {
+                            Ok(batches) => {
+                                assert_eq!(&batches, lone);
+                                admitted.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                assert!(
+                                    matches!(error, DataFusionError::ResourcesExhausted(_)),
+                                    "{error}"
+                                );
+                                let error = error.to_string();
+                                assert!(error.contains(MEMORY_BYTES_VARIABLE), "{error}");
+                                refused.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        done.store(true, Ordering::Release);
+        assert!(monitor.join().unwrap() > 0);
+    });
+    let (admitted, refused) = (admitted.into_inner(), refused.into_inner());
+    eprintln!("shared budget: {admitted} reads admitted, {refused} refused");
+    assert_eq!(admitted + refused, THREADS * ROUNDS);
+    assert!(admitted > 0, "no read was admitted");
+    assert!(
+        refused > 0,
+        "no read was refused, so the budget was never contended"
+    );
+    let memory = store.memory().unwrap();
+    assert!(memory.peak_bytes <= limit, "{memory:?}");
+    assert_eq!(memory.used_bytes, baseline, "every read's bytes returned");
+    store.pool.checkpoint().unwrap();
+}
+
+/// A read's own deadline, work budget and memory limit stop that read, and
+/// only it: a read running beside it on the same cached projection finishes
+/// with the lone result, and the pool is untouched.
+#[test]
+fn a_reads_own_limits_stop_it_alone() {
+    let store = Store::new(usize::MAX);
+    let name = "limited";
+    stage_read_graph(&store, name, READ_NODES, READ_DEGREE);
+    let sibling_args = pagerank_for(SIBLING_ITERATIONS);
+    let lone = store
+        .run(
+            &store.query(QueryLimits::default()).unwrap(),
+            "pagerank",
+            name,
+            &sibling_args,
+        )
+        .unwrap();
+    assert_eq!(iterations_run(&lone), SIBLING_ITERATIONS as i64);
+    let baseline = store.memory().unwrap().used_bytes;
+    let cases = [
+        (
+            QueryLimits {
+                timeout: Some(Duration::from_millis(20)),
+                ..QueryLimits::default()
+            },
+            // Far more than 20ms of work on any machine.
+            pagerank_for(100 * VICTIM_ITERATIONS),
+            "timed out",
+        ),
+        (
+            QueryLimits {
+                work_units: Some(10_000),
+                ..QueryLimits::default()
+            },
+            pagerank_for(VICTIM_ITERATIONS),
+            "work budget exceeded",
+        ),
+        (
+            QueryLimits {
+                memory_bytes: Some(1_024),
+                ..QueryLimits::default()
+            },
+            pagerank_for(VICTIM_ITERATIONS),
+            "1024-byte memory limit (`memoryLimitBytes`)",
+        ),
+    ];
+    for (limits, args, expected) in cases {
+        let limited = store.query(limits).unwrap();
+        let sibling = store.query(QueryLimits::default()).unwrap();
+        let (stopped, finished) = std::thread::scope(|scope| {
+            let l = scope.spawn(|| store.run(&limited, "pagerank", name, &args));
+            let s = scope.spawn(|| store.run(&sibling, "pagerank", name, &sibling_args));
+            (l.join().unwrap(), s.join().unwrap())
+        });
+        let error = stopped.expect_err(expected).to_string();
+        assert!(error.contains(expected), "{limits:?}: {error}");
+        assert_eq!(finished.unwrap(), lone, "{limits:?}");
+        sibling.context.checkpoint().unwrap();
+        store.pool.checkpoint().unwrap();
+        assert_eq!(store.memory().unwrap().used_bytes, baseline);
+    }
+}
+
+/// The limits are read options, taken out before Grust validates the rest,
+/// in any case and as numbers or text, since data source options arrive as
+/// lowercased strings. A table carries them to every scan.
+#[test]
+fn read_limits_are_read_options() {
+    let mut options = serde_json::json!({
+        "timeoutms": "250",
+        "WorkLimit": 7,
+        "memoryLimitBytes": "4096",
+        "damping": 0.85,
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let limits = QueryLimits::take(&mut options).unwrap();
+    assert_eq!(
+        limits,
+        QueryLimits {
+            timeout: Some(Duration::from_millis(250)),
+            work_units: Some(7),
+            memory_bytes: Some(4_096),
+        }
+    );
+    assert_eq!(options.keys().collect::<Vec<_>>(), ["damping"]);
+    validate("pagerank", &options).unwrap();
+    for bad in [
+        serde_json::json!("-1"),
+        serde_json::json!(1.5),
+        serde_json::json!("soon"),
+    ] {
+        let mut options = serde_json::Map::new();
+        options.insert(TIMEOUT_OPTION.into(), bad.clone());
+        let error = QueryLimits::take(&mut options).unwrap_err().to_string();
+        assert!(error.contains(TIMEOUT_OPTION), "{bad}: {error}");
+    }
+    let mut none = no_options();
+    assert_eq!(
+        QueryLimits::take(&mut none).unwrap(),
+        QueryLimits::default()
+    );
+
+    let name = "limited-table";
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[edges(&["a", "b", "c"], &["b", "c", "a"], None)],
+        &ColumnMapping::default(),
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
+    let options = serde_json::json!({ "workLimit": "1" });
+    let table = AlgorithmTable::new("pagerank", name.into(), options.as_object().unwrap()).unwrap();
+    assert_eq!(table.limits().work_units, Some(1));
+    let error = table.batches().unwrap_err().to_string();
+    assert!(error.contains("work budget exceeded"), "{error}");
+    let open = AlgorithmTable::new("pagerank", name.into(), &no_options()).unwrap();
+    assert_eq!(open.batches().unwrap()[0].num_rows(), 3);
+    assert!(Registry::drop(name).unwrap());
 }

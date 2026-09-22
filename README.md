@@ -144,8 +144,11 @@ memory is freed. A write is admitted a batch at a time as Sail streams it:
 Bytes are measured as the Arrow allocations the rows keep alive, each counted
 once at its capacity. A batch sliced from a larger one is charged for the
 whole buffer when it is staged `asStaged`. A canonical write copies it
-compactly. Replacing a part, restaging (which evicts the graph's cached
-projections) and `Registry::drop` return their bytes. A read still running
+compactly. Its sorted copy is admitted at an upper bound before it is made
+and shrunk to its real size once it is, so a sorted part is charged exactly
+what it keeps alive; the peak keeps the bound. Replacing a part, restaging
+(which evicts the graph's cached projections) and `Registry::drop` return
+their bytes. A read still running
 on an evicted projection holds its bytes until it finishes.
 
 To see what is using memory, `nutmeg_graphs()` and
@@ -156,6 +159,54 @@ To see what is using memory, `nutmeg_graphs()` and
 - `usedBytes`: staged rows, writes in progress, projections and kernels
 - `stagedBytes`: the total over graphs
 - `peakBytes`
+
+### Reads
+
+Every read (a `spark.read.format("nutmeg")` scan, a `nutmeg_<algorithm>`
+table function, or `nutmeg_graph::Query` from Rust) runs on its own Grust
+child of the budget's execution:
+
+- **Memory** is shared. Every byte a read takes counts against the child
+  and against `NUTMEG_MEMORY_BYTES` in one admission, so any number of
+  concurrent reads cannot together exceed the budget. A read that does not
+  fit is refused with `ResourcesExhausted`; the others go on.
+- **What outlives a read stays on the budget.** Staged rows, their sort, and
+  cached projections are built on the budget's execution and owned by it.
+  So is the transpose an in-arc kernel (PageRank, SCC, label propagation,
+  Yen's, spectral) builds the first time it needs one. It is cached with the
+  projection. What only the read uses is charged to the read and returned
+  when it finishes: nodes derived from edges, node properties, kernel
+  scratch, result batches.
+- **Stopping is per read.** Each read has its own cancellation, work counter,
+  work budget and deadline. The kernel runs through a view of the cached
+  projection (`GraphProjection::with_execution`) on the read's child. When a
+  read is cancelled or hits a limit, it fails and nothing else is affected:
+  not the budget, not the cached projection, not any other read on it.
+  Cancelling the budget's execution would stop every read.
+
+A read has no limits of its own by default. It runs until it finishes,
+fails, or is cancelled, bounded only by the shared budget. A read opts in
+with read options (or keys in a table function's JSON configuration). Nutmeg
+takes them out before Grust validates the rest, as it does `columnNames`:
+
+| option | meaning |
+|---|---|
+| `timeoutMs` | deadline, in milliseconds from when the read starts running |
+| `workLimit` | Grust work units the read may charge |
+| `memoryLimitBytes` | a memory ceiling of the read's own, within the budget |
+
+There is no default deadline or work limit. Grust's work units are not
+comparable across kernels, and wall time depends on load. A default would
+fail large, legitimate reads on a busy machine and not on an idle one, and
+Spark sets no query timeout by default either.
+
+**Cancellation.** `Query::cancel` stops a read. Its kernel fails with
+`cancelled` at its next check. Sail's interrupt does not reach a read today.
+The kernel runs inside the table's `scan`, which DataFusion calls while it
+plans the query. That is before Sail creates the executor whose stream an
+interrupt drops, and the call is synchronous, so dropping its future cannot
+stop it. Sail's interrupt could reach it if the kernel ran in the scan's
+execution stream and dropping the stream cancelled its read.
 
 ## Sail
 

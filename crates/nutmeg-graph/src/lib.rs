@@ -25,13 +25,16 @@
 //! sort, cached projections and running kernels. It is a Grust
 //! `ExecutionContext`, so a write is admitted before its rows are copied and
 //! refused, leaving the graph as it was, when it does not fit; see
-//! [`Staging`] and [`Registry::memory`].
+//! [`Staging`] and [`Registry::memory`]. Each read runs on a child of that
+//! context ([`Query`]): its memory counts against the one budget, and its
+//! cancellation, deadline and work budget ([`QueryLimits`]) are its own.
 //!
 //! This crate knows nothing about Sail or Spark: it registers into any
 //! DataFusion 55 `SessionContext`. `nutmeg-sail` adapts it to a Sail session.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use arrow::array::{
     Array, ArrayData, ArrayRef, AsArray, BooleanArray, FixedSizeListArray, Float64Array,
@@ -55,8 +58,9 @@ use grust_algorithms::{
 };
 use grust_core::Value;
 use grust_procedures::{
-    ExecutionContext, ExecutionLimits, MemoryReservation, ProcedureDefinition, ProcedureError,
-    ProcedureRegistry, RegistryBuilder, SnapshotIdentity, ValidatedArguments, ValueType,
+    ChildLimits, ExecutionContext, ExecutionLimits, MemoryReservation, ProcedureDefinition,
+    ProcedureError, ProcedureRegistry, RegistryBuilder, ResourceUsage, SnapshotIdentity,
+    ValidatedArguments, ValueType,
 };
 use once_cell::sync::{Lazy, OnceCell};
 
@@ -698,13 +702,17 @@ fn canonicalize(
         out.push(RecordBatch::try_new(schema.clone(), columns)?);
     }
     // The bound covers every type `interleave` copies exactly; anything it
-    // underestimated is admitted now, and refused like the rest.
+    // underestimated is admitted now, and refused like the rest. What it
+    // overestimated is returned now, so the part holds what the copy keeps
+    // alive and not the bound for as long as it is staged.
     let held = held_bytes(&out);
     if held > sorted.bytes() {
         let excess = held - sorted.bytes();
         budget.admit(&mut sorted, excess, || {
             format!("{excess} bytes more for the sorted copy, measured once made")
         })?;
+    } else {
+        sorted.shrink_to(held).map_err(err)?;
     }
     Ok((out, sorted))
 }
@@ -908,13 +916,39 @@ impl Admitted {
         self.bytes = self.bytes.saturating_add(other.bytes);
         self.tokens.extend(other.tokens);
     }
+
+    /// Lower the charge to `bytes`, returning the rest to the budget now, for
+    /// an admission of an upper bound whose real size is known. The latest
+    /// tokens give up their bytes first. Clones share the tokens, so this
+    /// lowers the charge for every clone; call it before any is made.
+    fn shrink_to(&mut self, bytes: usize) -> std::result::Result<(), ProcedureError> {
+        let mut excess = self.bytes.saturating_sub(bytes);
+        for token in self.tokens.iter().rev() {
+            if excess == 0 {
+                break;
+            }
+            let held = token.bytes();
+            let given = held.min(excess);
+            token.shrink(held - given)?;
+            excess -= given;
+            self.bytes -= given;
+        }
+        self.tokens.retain(|token| token.bytes() > 0);
+        Ok(())
+    }
 }
 
 /// Admission from the memory budget on behalf of one graph, so a refusal can
 /// say which graph, what for, and how much. `part` is the part being staged,
 /// or `None` for the nodes a read derives from the edges.
+///
+/// `charge` is the execution the bytes are admitted through: the pool for
+/// what outlives a query (staged rows, their sort, a projection's build), a
+/// query's own child of the pool for what the query alone uses. Either way
+/// every byte counts against the pool, which is what a refusal reports.
 struct Budget<'a> {
     pool: &'a ExecutionContext,
+    charge: &'a ExecutionContext,
     graph: &'a str,
     part: Option<Part>,
 }
@@ -931,27 +965,39 @@ impl Budget<'_> {
         if bytes == 0 {
             return Ok(());
         }
-        match self.pool.reserve(bytes) {
+        match self.charge.reserve(bytes) {
             Ok(token) => {
                 into.bytes = into.bytes.saturating_add(bytes);
                 into.tokens.push(token);
                 Ok(())
             }
-            Err(ProcedureError::BudgetExceeded { .. }) => Err(self.refused(&what())),
+            Err(ProcedureError::BudgetExceeded { limit, .. }) => Err(self.refused(&what(), limit)),
             Err(other) => Err(err(other)),
         }
     }
 
     /// Refuse now, before copying, when `bytes` would not fit what is free.
     fn check(&self, bytes: usize, what: impl FnOnce() -> String) -> Result<()> {
-        match self.pool.check_memory_available(bytes) {
+        match self.charge.check_memory_available(bytes) {
             Ok(()) => Ok(()),
-            Err(ProcedureError::BudgetExceeded { .. }) => Err(self.refused(&what())),
+            Err(ProcedureError::BudgetExceeded { limit, .. }) => Err(self.refused(&what(), limit)),
             Err(other) => Err(err(other)),
         }
     }
 
-    fn refused(&self, what: &str) -> DataFusionError {
+    /// The refusal of an admission that the execution with memory limit
+    /// `limit` refused: a read's own limit when that is the one, else the
+    /// process budget.
+    fn refused(&self, what: &str, limit: usize) -> DataFusionError {
+        let own = self.charge.limits().memory_bytes;
+        if limit == own && own < self.pool.limits().memory_bytes {
+            let used = self.charge.usage().map_or(0, |u| u.live_bytes);
+            return DataFusionError::ResourcesExhausted(format!(
+                "nutmeg: graph `{}`: reading it needs {what}, but {used} of this read's \
+                 {own}-byte memory limit (`{QUERY_MEMORY_OPTION}`) are in use",
+                self.graph,
+            ));
+        }
         let used = self.pool.usage().map_or(0, |u| u.live_bytes);
         let (doing, outcome) = match self.part {
             Some(part) => (
@@ -994,8 +1040,9 @@ pub struct GraphInfo {
     pub staged_nodes: usize,
     pub staged_edges: usize,
     /// Bytes of the memory budget the staged rows hold: at least what they
-    /// keep alive ([`held_bytes`]), and for a sorted part at most its sort's
-    /// bound on the copy. Projections are not included; see [`MemoryInfo`].
+    /// keep alive ([`held_bytes`]), and exactly that for a sorted part, whose
+    /// sort's bound on the copy is shrunk to the copy once it is made.
+    /// Projections are not included; see [`MemoryInfo`].
     pub staged_bytes: usize,
     pub revision: u64,
     pub projections: usize,
@@ -1041,9 +1088,10 @@ impl Part {
 /// The budget is a Grust [`ExecutionContext`], so it is Grust's admission —
 /// exact under concurrency, released when a reservation token drops — that
 /// bounds staging too. Staged rows, each write's transient copies and its
-/// sort, every cached projection and every kernel run on one draw on it:
-/// projections are built with it as their context, and kernels run on a
-/// projection's context.
+/// sort, every cached projection and every read draw on it: projections are
+/// built with it as their context and owned by it, and each read runs its
+/// kernel on a child of it ([`Query`]), through a view of the projection, so
+/// reads share the budget but are cancelled, budgeted and deadlined apart.
 struct Store {
     graphs: RwLock<HashMap<String, Arc<RwLock<Entry>>>>,
     pool: ExecutionContext,
@@ -1161,10 +1209,16 @@ impl Store {
     }
 
     /// The nodes of `e` when none were staged, derived from its edges, with
-    /// the memory they take admitted before they are made.
-    fn derived_nodes(&self, name: &str, e: &Entry) -> Result<(RecordBatch, Admitted)> {
+    /// the memory they take admitted through `charge` before they are made.
+    fn derived_nodes(
+        &self,
+        name: &str,
+        e: &Entry,
+        charge: &ExecutionContext,
+    ) -> Result<(RecordBatch, Admitted)> {
         let budget = Budget {
             pool: &self.pool,
+            charge,
             graph: name,
             part: None,
         };
@@ -1176,23 +1230,30 @@ impl Store {
         Ok((derive_nodes(&e.edges, e.edges_canonical)?, admitted))
     }
 
-    fn staged_counts(&self, name: &str) -> Result<(usize, usize)> {
+    fn staged_counts(&self, name: &str, charge: &ExecutionContext) -> Result<(usize, usize)> {
         let entry = self.existing(name)?;
         let e = entry.read().map_err(|_| poisoned())?;
         let edges: usize = e.edges.iter().map(|b| b.num_rows()).sum();
         let nodes = if e.nodes.is_empty() {
-            self.derived_nodes(name, &e)?.0.num_rows()
+            self.derived_nodes(name, &e, charge)?.0.num_rows()
         } else {
             e.nodes.iter().map(|b| b.num_rows()).sum()
         };
         Ok((nodes, edges))
     }
 
-    fn node_batches(&self, name: &str) -> Result<(Vec<RecordBatch>, Admitted)> {
+    /// The node batches a projection of `name` is built from: those staged,
+    /// or, when only edges were staged, the endpoints derived from them, with
+    /// their admission through `charge`; hold it as long as they are used.
+    fn node_batches(
+        &self,
+        name: &str,
+        charge: &ExecutionContext,
+    ) -> Result<(Vec<RecordBatch>, Admitted)> {
         let entry = self.existing(name)?;
         let e = entry.read().map_err(|_| poisoned())?;
         if e.nodes.is_empty() {
-            let (nodes, admitted) = self.derived_nodes(name, &e)?;
+            let (nodes, admitted) = self.derived_nodes(name, &e, charge)?;
             Ok((vec![nodes], admitted))
         } else {
             Ok((e.nodes.clone(), Admitted::default()))
@@ -1211,7 +1272,9 @@ impl Store {
         }
         let derived;
         let nodes: &[RecordBatch] = if e.nodes.is_empty() {
-            derived = self.derived_nodes(name, &e)?;
+            // Transient, but taken on the pool like the projection it builds:
+            // a projection is shared by every query, so none of them owns it.
+            derived = self.derived_nodes(name, &e, &self.pool)?;
             std::slice::from_ref(&derived.0)
         } else {
             &e.nodes
@@ -1222,8 +1285,20 @@ impl Store {
             "nutmeg".into(),
         )
         .map_err(err)?;
-        // Built in the budget's own context: its reservations, and those of
-        // every kernel later run on it, are admitted from the one budget.
+        // Built in the pool's own context, which owns it: its reservations,
+        // and the transpose an in-arc kernel builds on first use, stay on the
+        // pool for as long as it is cached. Kernels do not run here; each
+        // query runs them on a view for its own child of the pool (`Query`).
+        //
+        // The transpose is not prepared here (`prepare_incoming`). A
+        // projection is built by the first read that needs it, not at
+        // staging, so that read would pay for it either way; and preparing it
+        // would charge a second adjacency to the shared budget for every
+        // directed projection, including those only out-arc kernels (BFS,
+        // Dijkstra, degree, ...) ever read. Built on first use it is still
+        // built once, charged to the pool, and kept with the projection; the
+        // read that builds it is charged the work and can be stopped during
+        // it, which keeps nothing.
         let graph = GraphProjection::from_arrow_batches(
             identity,
             nodes,
@@ -1247,6 +1322,124 @@ impl Store {
         })?;
         e.projections.insert(key, graph.clone());
         Ok(graph)
+    }
+
+    /// A read on this store's budget: a child of the pool (see [`Query`]).
+    fn query(&self, limits: QueryLimits) -> Result<Query> {
+        // A timeout too far away to represent is no deadline.
+        let deadline = limits
+            .timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout));
+        let context = self
+            .pool
+            .child(ChildLimits {
+                memory_bytes: limits.memory_bytes,
+                work_units: limits.work_units.unwrap_or(usize::MAX),
+                deadline,
+                ..ChildLimits::default()
+            })
+            .map_err(|e| DataFusionError::Plan(format!("nutmeg: read limits: {e}")))?;
+        Ok(Query { context })
+    }
+
+    /// Run `algorithm` on `graph_name` for `query`: the projection is
+    /// fetched or built on the pool, which owns it, and everything the read
+    /// does runs through a view of it on the read's own execution.
+    fn run(
+        &self,
+        query: &Query,
+        algorithm: &str,
+        graph_name: &str,
+        args: &ValidatedArguments,
+    ) -> Result<Vec<RecordBatch>> {
+        let definition = definition_of(algorithm)?;
+        self.run_kernel(query, algorithm, graph_name, args)?
+            .into_iter()
+            .map(|batch| conform(definition, batch))
+            .collect()
+    }
+
+    fn run_kernel(
+        &self,
+        query: &Query,
+        algorithm: &str,
+        graph_name: &str,
+        args: &ValidatedArguments,
+    ) -> Result<Vec<RecordBatch>> {
+        let context = &query.context;
+        // A kernel's memory refusal says which budget refused it, as the
+        // read's own admissions do.
+        let failed = |error: ProcedureError| match error {
+            ProcedureError::BudgetExceeded {
+                resource: "memory",
+                limit,
+            } => Budget {
+                pool: &self.pool,
+                charge: context,
+                graph: graph_name,
+                part: None,
+            }
+            .refused(&format!("more memory for `{algorithm}`"), limit),
+            other => err(other),
+        };
+        // A read cancelled, or out of time, before it starts builds nothing.
+        context.checkpoint().map_err(err)?;
+        if algorithm == "estimateCsr" {
+            // Sizing before building: counts only, as in Grust's procedure.
+            let (nodes, edges) = self.staged_counts(graph_name, context)?;
+            let options = projection_options(args)?;
+            let weighted = matches!(options.weight, WeightSelection::Property { .. });
+            let e = CsrEstimate::upper_bound(nodes, edges, options.orientation, weighted)
+                .map_err(err)?;
+            return int_row(
+                &output_names(algorithm)?,
+                &[
+                    nodes,
+                    edges,
+                    e.max_arcs,
+                    e.outgoing_bytes,
+                    e.reverse_bytes,
+                    e.positions_bytes,
+                ],
+            );
+        }
+        let cached = self.projection(graph_name, args)?;
+        // The projection is the pool's and may be shared by any number of
+        // reads; the view runs this read's kernel on this read's execution.
+        // Grust refuses a view on any execution not within the owner's.
+        let view = cached.with_execution(context).map_err(err)?;
+        let g = &view;
+        let cursor = match algorithm {
+            "projectionStats" => {
+                let s = g.statistics().map_err(failed)?;
+                return int_row(
+                    &output_names(algorithm)?,
+                    &[s.nodes, s.edges, s.arcs, s.self_loops, s.csr_bytes],
+                );
+            }
+            // Every projection kernel Grust registers, by name: Grust finds the
+            // kernel, reads its options and returns its typed Arrow results, so a
+            // new registration is served here with no code of Nutmeg's own. A
+            // kernel that reads node properties names them through its options;
+            // they are read from the staged node rows and handed over with the
+            // projection. One that reads none takes the projection alone, so the
+            // common path builds nothing extra.
+            _ => {
+                let wanted = grust_algorithm_procedures::node_property_requests(algorithm, args)
+                    .map_err(err)?;
+                if wanted.is_empty() {
+                    grust_algorithm_procedures::run_on_projection(algorithm, g, args)
+                        .map_err(failed)?
+                } else {
+                    let (nodes, _derived) = self.node_batches(graph_name, context)?;
+                    let properties =
+                        NodeProperties::from_arrow_batches(&nodes, g, &wanted).map_err(failed)?;
+                    grust_algorithm_procedures::run_with_properties(algorithm, &properties, args)
+                        .map_err(failed)?
+                }
+            }
+        };
+        drain(cursor, failed)
     }
 }
 
@@ -1275,6 +1468,7 @@ impl Staging<'_> {
     fn budget(&self) -> Budget<'_> {
         Budget {
             pool: &self.store.pool,
+            charge: &self.store.pool,
             graph: &self.graph,
             part: Some(self.part),
         }
@@ -1296,6 +1490,7 @@ impl Staging<'_> {
         let rows = batch.num_rows();
         let budget = Budget {
             pool: &self.store.pool,
+            charge: &self.store.pool,
             graph: &self.graph,
             part: Some(self.part),
         };
@@ -1450,23 +1645,141 @@ impl Registry {
         store().memory()
     }
 
-    fn staged_counts(name: &str) -> Result<(usize, usize)> {
-        store().staged_counts(name)
-    }
-
-    /// The node batches a projection of `name` is built from: those staged,
-    /// or, when only edges were staged, the endpoints derived from them. A
-    /// kernel's node properties are read from these, row-aligned with the
-    /// projection by node id. The admission for derived nodes comes with
-    /// them; hold it as long as they are used.
+    /// The node batches a projection of `name` is built from (see
+    /// [`Store::node_batches`]), with derived nodes admitted on the pool.
+    #[cfg(test)]
     fn node_batches(name: &str) -> Result<(Vec<RecordBatch>, Admitted)> {
-        store().node_batches(name)
+        let store = store();
+        store.node_batches(name, &store.pool)
     }
 
     /// The projection of `name` under the projection options in `args`,
-    /// built on first use and kept until the graph is staged again.
+    /// built on first use and kept until the graph is staged again. It is
+    /// owned by the pool ([`GraphProjection::owner`]); a kernel run on it
+    /// directly runs on the pool's execution, so cancelling it would cancel
+    /// every query. Run reads through a [`Query`] instead.
     pub fn projection(name: &str, args: &ValidatedArguments) -> Result<GraphProjection> {
         store().projection(name, args)
+    }
+}
+
+/// The read option (and SQL configuration key) that sets a read's deadline,
+/// in milliseconds from when it starts running. See [`QueryLimits`].
+pub const TIMEOUT_OPTION: &str = "timeoutMs";
+
+/// The read option that sets a read's work budget, in Grust work units.
+pub const WORK_LIMIT_OPTION: &str = "workLimit";
+
+/// The read option that sets a memory ceiling of a read's own, in bytes,
+/// within the process budget.
+pub const QUERY_MEMORY_OPTION: &str = "memoryLimitBytes";
+
+/// The options [`QueryLimits::take`] removes, which no kernel may declare.
+pub const QUERY_OPTIONS: [&str; 3] = [TIMEOUT_OPTION, WORK_LIMIT_OPTION, QUERY_MEMORY_OPTION];
+
+/// Limits of one read's own, on top of the process budget.
+///
+/// None is set by default: a read runs until it finishes, fails, or is
+/// cancelled ([`Query::cancel`]), bounded only by `NUTMEG_MEMORY_BYTES`. A
+/// read opts in with the read options `timeoutMs`, `workLimit` and
+/// `memoryLimitBytes`, which Nutmeg takes out before Grust validates the
+/// rest, like `columnNames`. Each limit stops that read alone; the process
+/// budget, the cached projection and every other read are untouched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueryLimits {
+    /// Wall time from the start of the read's run to its deadline.
+    pub timeout: Option<Duration>,
+    /// Grust work units the read may charge, counted on its own counter.
+    pub work_units: Option<usize>,
+    /// Bytes the read may hold at once, in addition to (never above) the
+    /// process budget. Memory kept past the read — a projection it causes to
+    /// be built, a transpose a kernel caches — is the process's, not the
+    /// read's, and does not count against this.
+    pub memory_bytes: Option<usize>,
+}
+
+impl QueryLimits {
+    /// Remove the limits from a JSON configuration, leaving Grust's options.
+    /// Keys match in any case, as data source options arrive lowercased;
+    /// values are non-negative integers, as numbers or as their text.
+    pub fn take(options: &mut serde_json::Map<String, serde_json::Value>) -> Result<Self> {
+        let mut take = |name: &str| -> Result<Option<usize>> {
+            let Some(key) = options
+                .keys()
+                .find(|k| k.eq_ignore_ascii_case(name))
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            let value = options.remove(&key).expect("found");
+            let parsed = match &value {
+                serde_json::Value::Number(n) => n.as_u64(),
+                serde_json::Value::String(text) => text.trim().parse::<u64>().ok(),
+                _ => None,
+            };
+            match parsed.map(usize::try_from) {
+                Some(Ok(n)) => Ok(Some(n)),
+                _ => plan_err!("nutmeg: `{name}` must be a non-negative integer, got {value}"),
+            }
+        };
+        Ok(Self {
+            timeout: take(TIMEOUT_OPTION)?.map(|ms| Duration::from_millis(ms as u64)),
+            work_units: take(WORK_LIMIT_OPTION)?,
+            memory_bytes: take(QUERY_MEMORY_OPTION)?,
+        })
+    }
+}
+
+/// One read's execution: a Grust child of the process's memory budget.
+///
+/// Every byte a read admits counts against the one budget
+/// (`NUTMEG_MEMORY_BYTES`), so concurrent reads cannot jointly exceed it. Its
+/// work counter, work budget, cancellation and deadline are its own:
+/// [`Query::cancel`], a [`QueryLimits`] deadline or work budget running out,
+/// stop this read and reach neither the budget, the cached projection nor any
+/// other read. Cancelling the budget itself would stop every read.
+///
+/// Long-lived memory stays on the budget: staged rows, their sort and cached
+/// projections (with the transpose a kernel caches in one) outlive any read.
+/// What a read alone uses — the nodes it derives, the node properties it
+/// reads, kernel scratch and result batches — is admitted through the read,
+/// and returned when the read's reservations drop.
+///
+/// Cloning shares the execution, so a clone handed to another thread cancels
+/// the same read.
+#[derive(Clone, Debug)]
+pub struct Query {
+    context: ExecutionContext,
+}
+
+impl Query {
+    /// A read on the process budget, not yet started. A `timeout` counts from
+    /// now.
+    pub fn new(limits: QueryLimits) -> Result<Self> {
+        store().query(limits)
+    }
+
+    /// Stop the read. A kernel running for it stops at its next check and
+    /// fails with `cancelled`; a read not yet run fails when it starts.
+    /// Cancelling is permanent and reaches nothing but this read.
+    pub fn cancel(&self) -> Result<()> {
+        self.context.cancel().map_err(err)
+    }
+
+    /// The read's own figures: its live and peak bytes (part of the budget's)
+    /// and the work it has charged.
+    pub fn usage(&self) -> Result<ResourceUsage> {
+        self.context.usage().map_err(err)
+    }
+
+    /// Run one Grust algorithm on the named graph for this read. See [`run`].
+    pub fn run(
+        &self,
+        algorithm: &str,
+        graph_name: &str,
+        args: &ValidatedArguments,
+    ) -> Result<Vec<RecordBatch>> {
+        store().run(self, algorithm, graph_name, args)
     }
 }
 
@@ -1647,9 +1960,12 @@ pub fn options_from_strings(
     Ok(out)
 }
 
-fn drain(mut cursor: ArrowResultCursor) -> Result<Vec<RecordBatch>> {
+fn drain(
+    mut cursor: ArrowResultCursor,
+    failed: impl Fn(ProcedureError) -> DataFusionError,
+) -> Result<Vec<RecordBatch>> {
     let mut out = Vec::new();
-    while let Some(batch) = cursor.next_batch().map_err(err)? {
+    while let Some(batch) = cursor.next_batch().map_err(&failed)? {
         out.push(batch.record_batch().clone());
     }
     Ok(out)
@@ -1691,7 +2007,8 @@ fn output_names(algorithm: &str) -> Result<Vec<&'static str>> {
         .collect())
 }
 
-/// Run one Grust algorithm on the named graph. Every batch carries the
+/// Run one Grust algorithm on the named graph, as a read of its own with no
+/// limits beyond the process budget ([`Query`]). Every batch carries the
 /// nullability Grust declares for each output column, whatever the rows in it
 /// happen to hold (see [`conform`]).
 pub fn run(
@@ -1699,11 +2016,7 @@ pub fn run(
     graph_name: &str,
     args: &ValidatedArguments,
 ) -> Result<Vec<RecordBatch>> {
-    let definition = definition_of(algorithm)?;
-    run_kernel(algorithm, graph_name, args)?
-        .into_iter()
-        .map(|batch| conform(definition, batch))
-        .collect()
+    Query::new(QueryLimits::default())?.run(algorithm, graph_name, args)
 }
 
 /// Restate a result batch's schema with each column's declared nullability.
@@ -1753,64 +2066,6 @@ fn conform(definition: &ProcedureDefinition, batch: RecordBatch) -> Result<Recor
             definition.name
         ))
     })
-}
-
-fn run_kernel(
-    algorithm: &str,
-    graph_name: &str,
-    args: &ValidatedArguments,
-) -> Result<Vec<RecordBatch>> {
-    if algorithm == "estimateCsr" {
-        // Sizing before building: counts only, as in Grust's procedure.
-        let (nodes, edges) = Registry::staged_counts(graph_name)?;
-        let options = projection_options(args)?;
-        let weighted = matches!(options.weight, WeightSelection::Property { .. });
-        let e =
-            CsrEstimate::upper_bound(nodes, edges, options.orientation, weighted).map_err(err)?;
-        return int_row(
-            &output_names(algorithm)?,
-            &[
-                nodes,
-                edges,
-                e.max_arcs,
-                e.outgoing_bytes,
-                e.reverse_bytes,
-                e.positions_bytes,
-            ],
-        );
-    }
-    let graph = Registry::projection(graph_name, args)?;
-    let g = &graph;
-    let cursor = match algorithm {
-        "projectionStats" => {
-            let s = g.statistics().map_err(err)?;
-            return int_row(
-                &output_names(algorithm)?,
-                &[s.nodes, s.edges, s.arcs, s.self_loops, s.csr_bytes],
-            );
-        }
-        // Every projection kernel Grust registers, by name: Grust finds the
-        // kernel, reads its options and returns its typed Arrow results, so a
-        // new registration is served here with no code of Nutmeg's own. A
-        // kernel that reads node properties names them through its options;
-        // they are read from the staged node rows and handed over with the
-        // projection. One that reads none takes the projection alone, so the
-        // common path builds nothing extra.
-        _ => {
-            let wanted =
-                grust_algorithm_procedures::node_property_requests(algorithm, args).map_err(err)?;
-            if wanted.is_empty() {
-                grust_algorithm_procedures::run_on_projection(algorithm, g, args).map_err(err)?
-            } else {
-                let (nodes, _derived) = Registry::node_batches(graph_name)?;
-                let properties =
-                    NodeProperties::from_arrow_batches(&nodes, g, &wanted).map_err(err)?;
-                grust_algorithm_procedures::run_with_properties(algorithm, &properties, args)
-                    .map_err(err)?
-            }
-        }
-    };
-    drain(cursor)
 }
 
 fn probe_args(algorithm: &str, orientation: Option<&str>) -> Result<ValidatedArguments> {
@@ -2002,6 +2257,7 @@ pub struct AlgorithmTable {
     graph: String,
     args: Arc<ValidatedArguments>,
     names: ColumnNames,
+    limits: QueryLimits,
     schema: SchemaRef,
 }
 
@@ -2017,7 +2273,9 @@ impl AlgorithmTable {
 
     /// A table over `graph` whose columns are reported under `names`. The
     /// schema reported and the batches a scan returns are renamed by the same
-    /// function, and `batches` re-checks one against the other.
+    /// function, and `batches` re-checks one against the other. The read's own
+    /// limits ([`QueryLimits`]) are taken out of `options` before Grust
+    /// validates the rest.
     pub fn named(
         algorithm: &str,
         graph: String,
@@ -2030,17 +2288,39 @@ impl AlgorithmTable {
                 algorithm_names()
             );
         };
+        let mut options = options.clone();
+        let limits = QueryLimits::take(&mut options)?;
         Ok(Self {
             algorithm,
             graph,
-            args: Arc::new(validate(algorithm, options)?),
+            args: Arc::new(validate(algorithm, &options)?),
             names,
+            limits,
             schema: output_schema_named(algorithm, names)?,
         })
     }
 
+    /// The limits each scan of this table runs under.
+    pub fn limits(&self) -> QueryLimits {
+        self.limits
+    }
+
+    /// A read for one scan of this table, under its limits; its timeout
+    /// counts from now. Hand a clone to whatever may cancel it, and run it
+    /// with [`AlgorithmTable::batches_for`].
+    pub fn query(&self) -> Result<Query> {
+        Query::new(self.limits)
+    }
+
+    /// Run the table's algorithm as a read of its own, under its limits.
     pub fn batches(&self) -> Result<Vec<RecordBatch>> {
-        let batches = run(self.algorithm, &self.graph, &self.args)?
+        self.batches_for(&self.query()?)
+    }
+
+    /// Run the table's algorithm for `query`.
+    pub fn batches_for(&self, query: &Query) -> Result<Vec<RecordBatch>> {
+        let batches = query
+            .run(self.algorithm, &self.graph, &self.args)?
             .into_iter()
             .map(|batch| self.names.rename_batch(batch))
             .collect::<Result<Vec<_>>>()?;
