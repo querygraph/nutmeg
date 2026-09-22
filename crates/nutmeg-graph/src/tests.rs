@@ -1,6 +1,9 @@
 use super::*;
 use arrow::array::{Float64Array, Int32Array};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
+// Only the SQL tests collect a DataFrame's stream.
+#[cfg(feature = "sql")]
+use futures::TryStreamExt;
 use std::collections::BTreeSet;
 
 fn edges(source: &[&str], target: &[&str], weight: Option<&[f64]>) -> RecordBatch {
@@ -256,6 +259,11 @@ fn explicit_nodes_make_unknown_endpoints_an_error() {
     Registry::projection(name, &validate("degree", &no_options()).unwrap()).unwrap();
 }
 
+// Needs DataFusion's SQL parser: `cargo test -p nutmeg-graph --features sql`.
+// The feature is off by default because DataFusion's `sql` feature adds an
+// error variant Sail's exhaustive match does not cover, so one cargo
+// invocation cannot build both it and `nutmeg-sail`.
+#[cfg(feature = "sql")]
 #[tokio::test]
 async fn every_algorithm_runs_through_sql() -> Result<()> {
     Registry::stage(

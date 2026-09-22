@@ -73,8 +73,11 @@ class _Algorithm:
         """Run the algorithm and return its rows as a DataFrame.
 
         Keywords are the algorithm's own options, validated by Grust, plus
-        `concurrency`, which is how many threads the kernel may use in the
-        server. Without it the kernel runs on one thread.
+        the read's own: `concurrency`, how many threads the kernel may use in
+        the server (without it the kernel runs single-threaded), and
+        `timeoutMs`, `workLimit` and `memoryLimitBytes`, which stop this read
+        alone. Reads of one graph share its cached projection whatever they
+        ask for.
         """
         return self._nutmeg.run(self._name, graph, **configuration)
 

@@ -194,6 +194,13 @@ takes them out before Grust validates the rest, as it does `columnNames`:
 | `timeoutMs` | deadline, in milliseconds from when the read starts running |
 | `workLimit` | Grust work units the read may charge |
 | `memoryLimitBytes` | a memory ceiling of the read's own, within the budget |
+| `concurrency` | threads the read's kernel may use |
+
+`concurrency` is the read's, not the graph's: the kernel runs on the read's
+own child execution, so one read asking for eight threads gives none to
+another read sharing the same cached projection. Without it the kernel runs
+the code that predates threads, single-threaded, which is what a server with
+its own scheduler should get unless it asks otherwise.
 
 There is no default deadline or work limit. Grust's work units are not
 comparable across kernels, and wall time depends on load. A default would
@@ -241,18 +248,36 @@ Kubernetes worker is a process of its own and would not hold the driver's
 graphs (local-cluster workers are actors in the server's process). Nutmeg is
 a local-mode extension today.
 
-## Sail
+## Grust and Sail
 
-Nutmeg builds against a Sail checkout at `../sail` (commit recorded in
-`SAIL_COMMIT`). Registering an external data source and table functions in
-a Sail session needs one hook that Sail does not expose today — a way for
-an embedder to choose the session factory, described in `docs/sail-prs.md`.
-It is one isolated commit on its own branch of the Sail checkout, proposed
-to Sail only after the full Spark compatibility suite passes on it, and
-only on explicit go-ahead. Nothing graph-specific goes into Sail. No second
-change is needed: Sail's SQL resolver already finds table functions
-registered in the session, so `SELECT * FROM nutmeg_pagerank('g')` works in
-Spark SQL as well as `spark.read.format("nutmeg")`.
+Nutmeg builds against sibling checkouts, `../grust` and `../sail`, as
+unpinned path dependencies: the workspace `Cargo.toml` names the paths and
+no version or revision, so a build takes whatever those checkouts are
+currently at. Nothing in the build checks them. The commits this head was
+built and tested against are recorded in two one-line files, and in the Citi
+Bike example's versions table:
+
+| file | commit |
+|---|---|
+| `GRUST_COMMIT` | `ca68900` — `querygraph/grust` main: child executions, `with_execution`, `prepare_incoming`, Arrow declared nullability |
+| `SAIL_COMMIT` | `f1cf1729` — upstream `lakehq/sail` main, which contains the session-factory hook from #2630 |
+
+Check the sibling checkouts out at those commits to reproduce a run. A
+published Grust release will replace the Grust path dependencies at the
+first Nutmeg release.
+
+Registering an external data source and table functions in a Sail session
+needs one hook: a way for an embedder to choose the session factory,
+described in `docs/sail-prs.md`. Upstream Sail has it as of the commit
+above, so `nutmeg-server` builds against Sail's own main with no local
+branch. Nothing graph-specific goes into Sail. No second change is needed:
+Sail's SQL resolver already finds table functions registered in the session,
+so `SELECT * FROM nutmeg_pagerank('g')` works in Spark SQL as well as
+`spark.read.format("nutmeg")`.
+
+Nutmeg is a **local-mode** extension: it does not work in Sail's cluster
+modes (`local-cluster`, `kubernetes-cluster`). See the materialised-reads
+note above and `CHANGELOG.md`.
 
 ## The twelve
 
