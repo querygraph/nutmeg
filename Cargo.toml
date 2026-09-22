@@ -16,8 +16,13 @@ publish = false
 # the Sail server, the Grust kernels and this crate.
 # No "sql" feature here: Sail builds DataFusion without it, and enabling it
 # adds an error variant Sail's exhaustive matches do not cover. Only
-# nutmeg-graph's own tests use SQL, through a dev-dependency feature, so run
-# them with `cargo test -p nutmeg-graph`, not across the workspace.
+# nutmeg-graph's tests use SQL, through that crate's `datafusion`
+# dev-dependency, whose features resolver 2 unifies into a build only when
+# nutmeg-graph's own test targets are built. So `cargo test -p nutmeg-graph`
+# has it, and an invocation that builds nutmeg-graph's tests together with
+# nutmeg-sail or nutmeg-server (`cargo test --workspace`, `cargo clippy
+# --workspace --all-targets`) cannot compile Sail; the gate keeps them apart
+# (README, "Building and testing").
 datafusion = { version = "55.1.0", default-features = false, features = ["recursive_protection"] }
 datafusion-common = { version = "55.1.0", default-features = false }
 datafusion-expr = { version = "55.1.0", default-features = false }

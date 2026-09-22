@@ -160,3 +160,14 @@ past its single algorithm. `run.sh` starts a built server, records the exact
 component versions and runs the script; `results/` holds the captured output,
 the numbers as JSON, the community map and a three-run rerun diff. The
 results committed here are the output of a run on this integrated head.
+
+## Building and testing
+
+`cargo test -p nutmeg-graph` now runs every `nutmeg-graph` test, the five
+that go through `ctx.sql` included; there is no `sql` feature to turn on.
+DataFusion's `sql` feature is on `nutmeg-graph`'s `datafusion` dev-dependency
+only, which resolver 2 unifies into a build only when that crate's own test
+targets are built, so `nutmeg-sail` and `nutmeg-server` still build DataFusion
+without the `DataFusionError::SQL` variant Sail's exhaustive match does not
+cover. The gate's clippy is two invocations for that reason; the README's
+"Building and testing" section has the chain.

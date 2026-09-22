@@ -1,8 +1,6 @@
 use super::*;
 use arrow::array::{Float64Array, Int32Array};
 use futures::StreamExt;
-// Only the SQL tests collect a DataFrame's stream.
-#[cfg(feature = "sql")]
 use futures::TryStreamExt;
 use std::collections::BTreeSet;
 
@@ -259,11 +257,6 @@ fn explicit_nodes_make_unknown_endpoints_an_error() {
     Registry::projection(name, &validate("degree", &no_options()).unwrap()).unwrap();
 }
 
-// Needs DataFusion's SQL parser: `cargo test -p nutmeg-graph --features sql`.
-// The feature is off by default because DataFusion's `sql` feature adds an
-// error variant Sail's exhaustive match does not cover, so one cargo
-// invocation cannot build both it and `nutmeg-sail`.
-#[cfg(feature = "sql")]
 #[tokio::test]
 async fn every_algorithm_runs_through_sql() -> Result<()> {
     Registry::stage(
@@ -564,11 +557,6 @@ fn every_algorithm_reports_the_columns_its_scan_returns_under_either_naming() {
     }
 }
 
-// Needs DataFusion's SQL parser: `cargo test -p nutmeg-graph --features sql`.
-// The feature is off by default because DataFusion's `sql` feature adds an
-// error variant Sail's exhaustive match does not cover, so one cargo
-// invocation cannot build both it and `nutmeg-sail`.
-#[cfg(feature = "sql")]
 #[tokio::test]
 async fn gds_names_are_chosen_per_read_and_grust_names_stay_reachable() -> Result<()> {
     Registry::stage(
@@ -2034,11 +2022,6 @@ fn a_streamed_write_is_refused_at_the_batch_that_crosses_the_budget() {
     assert_eq!(info_of(&store, "streamed").unwrap().staged_bytes, 3 * held);
 }
 
-// Needs DataFusion's SQL parser: `cargo test -p nutmeg-graph --features sql`.
-// The feature is off by default because DataFusion's `sql` feature adds an
-// error variant Sail's exhaustive match does not cover, so one cargo
-// invocation cannot build both it and `nutmeg-sail`.
-#[cfg(feature = "sql")]
 /// The graph listing reports each graph's staged bytes, and `nutmeg_memory()`
 /// the budget, what is in use and the staged total, through SQL.
 #[tokio::test]
@@ -2724,11 +2707,6 @@ fn stage_ring(name: &str, n: usize) {
     .unwrap();
 }
 
-// Needs DataFusion's SQL parser: `cargo test -p nutmeg-graph --features sql`.
-// The feature is off by default because DataFusion's `sql` feature adds an
-// error variant Sail's exhaustive match does not cover, so one cargo
-// invocation cannot build both it and `nutmeg-sail`.
-#[cfg(feature = "sql")]
 /// Planning a read, and explaining it, run no kernel: the plan is a
 /// `NutmegAlgorithmExec`, and neither `execute` nor anything before the
 /// stream's first poll starts the read. Polling it runs it once.
@@ -2902,11 +2880,6 @@ async fn a_slow_consumer_holds_a_streaming_read_to_a_few_batches() -> Result<()>
     Ok(())
 }
 
-// Needs DataFusion's SQL parser: `cargo test -p nutmeg-graph --features sql`.
-// The feature is off by default because DataFusion's `sql` feature adds an
-// error variant Sail's exhaustive match does not cover, so one cargo
-// invocation cannot build both it and `nutmeg-sail`.
-#[cfg(feature = "sql")]
 /// A `LIMIT` ends the stream once it has its rows, and stops the read.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_limit_stops_the_read_once_it_has_its_rows() -> Result<()> {
