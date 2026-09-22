@@ -21,14 +21,14 @@ during the run recorded there, and nothing below was typed in by hand.
 - `results/output.md` is the captured output of the run, and
   `results/results.json` holds the same numbers as data.
 - `results/communities.png` is the community map. `results/rerun-diff.txt`
-  is the diff between two consecutive runs.
+  compares three consecutive runs of the captured script.
 
 ## Versions of the captured run
 
 | component | version |
 |---|---|
-| grust commit | db00ee7708b7c0d97978b26cf235bab577a88428 |
-| nutmeg commit | f727f4de9676832d5fa5a7478e8bb07f1e42f5b9 (these results are committed on top of it) |
+| grust commit | fd4e3ec37fc12a5ab33ede5d5faa182fa277a5c2 (`work/arrow-declared-nullability`) |
+| nutmeg commit | cec30960d4f33dd866693ad437311889b7caa155 (`work/canonical-order`: 1492ca2 plus a live test; these results are committed on top of it) |
 | sail commit | f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f (upstream `lakehq/sail` main, which contains the session-factory hook from #2630) |
 | pyspark (client) | 4.2.0 (`pyspark-client`) |
 | server Spark version (spark.version) | 4.2.0 |
@@ -121,7 +121,7 @@ failure and then gives the same eleven columns explicitly.
 | 774 | 1595334 | 1595334 | 26234 | 25531544 |
 
 **Step 3: PageRank.** It converged in 55 iterations, with a last L1 change
-of 9.6995114111e-09 and scores summing to 1 over 774 nodes. The result
+of 9.69950689892e-09 and scores summing to 1 over 774 nodes. The result
 schema, cast to the tutorial's shape, is
 `struct<nodeId:bigint,pagerank:double>`.
 
@@ -186,7 +186,7 @@ Observed agreement, over all 774 stations:
 |---|---|---|---|---|---|
 | NetworkX vs NumPy reference | 5.515e-14 | 2.866e-13 | 3.995e-11 | same | same |
 | Nutmeg, default tolerance (stops at L1 change ≤ 1e-8) vs NumPy | 4.841e-09 | 3.674e-08 | 3.507e-06 | same | same |
-| Nutmeg, `tolerance` 1e-13 (114 iterations, converged) vs NumPy | 8.345e-14 | 4.371e-13 | 6.046e-11 | same | same |
+| Nutmeg, `tolerance` 1e-13 (114 iterations, converged) vs NumPy | 8.345e-14 | 4.404e-13 | 6.045e-11 | same | same |
 | Nutmeg, default, vs a reference that **collapses** parallel edges | 4.210e-03 | 2.634e-01 | 3.064e+00 | differs | differs |
 
 What these results show:
@@ -200,9 +200,15 @@ What these results show:
   3.674e-08.
 - At `tolerance` 1e-13, Nutmeg and the NumPy reference agree to 8.3e-14 per
   score. That is the same order as the gap between the two references
-  themselves (5.5e-14). **The scores are not bit-identical.** Across two
-  consecutive runs of the captured script, the last digits of these
-  differences changed (`results/rerun-diff.txt`).
+  themselves (5.5e-14). **The scores are not bit-identical** to the
+  reference. They are identical from run to run: three consecutive runs of
+  the captured script printed the same digits everywhere in this section
+  (`results/rerun-diff.txt`). Before Nutmeg kept staged graphs in a
+  canonical order, the last digits of these differences and of the last L1
+  change moved between consecutive runs (9.69951240834e-09 in one run,
+  9.6995114111e-09 in the next). The likely cause is that edge order fixes
+  the order of PageRank's floating-point sums; that was inferred from the
+  change, not traced in the kernel.
 - Against the collapsed reference, the top 10 differs. This confirms that
   Nutmeg counts parallel edges.
 
@@ -273,69 +279,81 @@ minutes.
 ### Station communities (Leiden)
 
 Leiden ran on the tutorial's trips, each trip an undirected edge of
-weight 1, with `seed` 42. It found **8 communities with modularity
-0.441135661**, in 3 levels, and converged. The result was written to
-`delta/station_communities`.
+weight 1, with `seed` 42, on the graph from Step 2 as staged. It found
+**8 communities with modularity 0.440828087**, in 3 levels, and converged.
+The result was written to `delta/station_communities`.
 
 **Reference check.** NetworkX recomputed the modularity of Nutmeg's
-partition from the CSV's trips: 0.441135661455. Nutmeg reports
-0.441135661455, and the printed difference is 0.000e+00.
+partition from the CSV's trips: 0.440828087484. Nutmeg reports
+0.440828087484, and the printed difference is 0.000e+00.
 
 **Reproducibility.** Leiden visits nodes in projection row order, shuffled
-by the seed. The row order follows the order in which the edges are staged,
-and Sail's scan of the Delta table did not keep that order fixed from run to
-run. During development, two runs of the unsorted staging gave modularity
-0.439815435 and 0.438930183. The script therefore stages the same trips
-sorted by station. Two consecutive runs of the captured script then gave
-identical community tables.
+by the seed, and the row order follows the order in which rows are staged.
+Sail's scan of the Delta table does not keep that order fixed from run to
+run: during development, two runs of the same unsorted staging gave
+modularity 0.439815435 and 0.438930183. Nutmeg now sorts every staged graph
+into a canonical order by default (the `order` write option; see the
+top-level README), and the script stages the trips once, with no sort of
+its own. Three consecutive runs of the captured script gave the same
+`output.md` byte for byte and the same community map
+(`results/rerun-diff.txt`). `results.json` keeps full precision, and there
+the runs differ only in the last one or two digits of `mean_minutes_in`
+and of the correlation computed from it. Those means are Sail SQL `AVG`s
+over the trips, which Nutmeg does not compute; every value Nutmeg returned
+was identical.
 
-That workaround is no longer needed, and the script no longer has it.
-Nutmeg now sorts every staged graph into a canonical order by default (the
-`order` write option; see the top-level README), so Leiden runs on the
-tutorial's graph from Step 2 as staged. The numbers above were produced by
-the old script, which sorted station ids as numbers. Canonical order compares
-ids as text, so the node order differs, and the next run may find a
-different partition and modularity from those recorded here. That run has
-not been made yet. What the change guarantees is that two runs on the same
-trips agree with each other.
+The partition is not the one an earlier version of this page reported.
+That run staged the trips a second time, sorted by station id **as a
+number**, and found 8 communities with modularity 0.441135661. Canonical
+order compares ids as text (`"10"` before `"9"`), so Leiden visits the nodes
+in a different order and finds a different partition of almost the same
+quality. Checked on this build, outside the captured run: staging the trips
+sorted numerically with `order` = `asStaged` gives 0.441135661455 again, and
+staging them in descending order with the default canonical order gives the
+captured partition exactly. Between the two partitions, 10 of 774 stations
+change community: 8 move from the downtown community to the midtown one
+(among them W 21 St & 6 Ave, which was downtown's highest-PageRank
+station), 1 from the uptown community to midtown and 1 from midtown to
+downtown. The other communities have the same members.
 
 **Geographic check.** Trips are the only input to the graph, which has no
 coordinates. If the communities are real, stations close together should
 land in the same community:
 
 - The mean distance from a station to its own community's centroid is
-  **1867 m** over 773 stations.
+  **1861 m** over 773 stations.
 - In 1000 shuffles of the community labels among stations, with community
-  sizes kept, the mean distance is 4471 m and the smallest is 4422 m. None
+  sizes kept, the mean distance is 4472 m and the smallest is 4420 m. None
   of the 1000 shuffles comes as close as the real partition.
-- For 0.846 of the stations, the nearest community centroid is their own
+- For 0.854 of the stations, the nearest community centroid is their own
   community's.
 
 ![Leiden communities on the map](results/communities.png)
 
 | community | stations | centroid | highest-PageRank station |
 |---|---|---|---|
-| 245 | 207 | 40.6828, -73.9768 | Hanson Pl & Ashland Pl |
-| 281 | 167 | 40.7870, -73.9600 | Broadway & W 60 St |
-| 79 | 162 | 40.7239, -73.9975 | W 21 St & 6 Ave |
-| 532 | 142 | 40.7406, -73.9414 | Metropolitan Ave & Bedford Ave |
-| 72 | 91 | 40.7529, -73.9860 | Pershing Square North |
+| 119 | 207 | 40.6828, -73.9768 | Hanson Pl & Ashland Pl |
+| 2006 | 166 | 40.7871, -73.9599 | Broadway & W 60 St |
+| 127 | 155 | 40.7231, -73.9977 | Broadway & E 22 St |
+| 2002 | 142 | 40.7406, -73.9414 | Metropolitan Ave & Bedford Ave |
+| 164 | 99 | 40.7520, -73.9865 | Pershing Square North |
 | 3182 | 3 | 40.6881, -74.0191 | Soissons Landing |
 | 3239 | 1 | 40.6465, -74.0166 | Bressler |
 
-On the map, community 245 covers the Brooklyn stations south of about
-40.716 N. Community 532 runs from Williamsburg and Greenpoint up through
+On the map, community 119 covers the Brooklyn stations south of about
+40.716 N. Community 2002 runs from Williamsburg and Greenpoint up through
 Long Island City and Astoria, on both sides of Newtown Creek. The Manhattan
-stations split into three latitude bands: downtown (79), midtown (72) and
-the Upper West and Upper East Sides together (281), with Central Park
+stations split into three latitude bands: downtown (127), midtown (164) and
+the Upper West and Upper East Sides together (2006), with Central Park
 between those last two. The three Governors Island stations (3182) are a
 community of their own.
 
-The eighth community has no row in the table because it contains only the
-out-of-town mobile station. The seven points west of -74.03 are the
+The eighth community (3650) has no row in the table because it contains
+only the out-of-town mobile station. The seven points west of -74.03 are the
 Jersey City stations from the dangling list in Part 1. In this file each one
 only receives trips, one to three apiece. They fall into Manhattan
-communities, which is what those few trips imply.
+communities, which is what those few trips imply: four into 127, two into
+164 and one into 2006, as read from this run's `delta/station_metrics`.
 
 ### Betweenness: hub stations on the quickest routes
 
@@ -348,16 +366,16 @@ costs are compared as `f64`. The link table is written to
 
 | station_name | betweenness | community |
 |---|---|---|
-| Queens Plaza North & Crescent St | 28906.2 | 532 |
-| Schermerhorn St & Bond St | 18167.3 | 245 |
-| W 43 St & 6 Ave | 15928.2 | 72 |
-| 45 Rd & 11 St | 15518.1 | 532 |
-| Broadway & W 41 St | 14820.8 | 72 |
-| Lawrence St & Willoughby St | 14538.7 | 245 |
-| Hanson Pl & Ashland Pl | 12531.7 | 245 |
-| Broadway & E 22 St | 12400 | 79 |
-| N 6 St & Bedford Ave | 12243.5 | 532 |
-| 1 Ave & E 62 St | 12187.3 | 281 |
+| Queens Plaza North & Crescent St | 28906.2 | 2002 |
+| Schermerhorn St & Bond St | 18167.3 | 119 |
+| W 43 St & 6 Ave | 15928.2 | 164 |
+| 45 Rd & 11 St | 15518.1 | 2002 |
+| Broadway & W 41 St | 14820.8 | 164 |
+| Lawrence St & Willoughby St | 14538.7 | 119 |
+| Hanson Pl & Ashland Pl | 12531.7 | 119 |
+| Broadway & E 22 St | 12400 | 127 |
+| N 6 St & Bedford Ave | 12243.5 | 2002 |
+| 1 Ave & E 62 St | 12187.3 | 2006 |
 
 The top station, Queens Plaza North & Crescent St, sits at the Queens end of
 the Queensboro Bridge, and 45 Rd & 11 St is nearby in Long Island City.
@@ -369,9 +387,10 @@ stations far more often than their PageRank suggests: Queens Plaza North is
 **Reference check.** NetworkX's `betweenness_centrality(weight=...,
 normalized=False)` ran on the same link table, read back from Delta. Over
 761 nodes the largest abs diff was 3.638e-12, with a largest score of
-28906.2, and the top 10 are in the same order. The previous run printed
-1.819e-12, so the difference is floating-point summation order, not an
-exact match.
+28906.2, and the top 10 are in the same order. It is not an exact match.
+The three runs in `results/rerun-diff.txt` all printed 3.638e-12; three
+earlier runs, made before canonical order, printed 1.819e-12, 3.638e-12 and
+5.457e-12.
 
 ### Results written back to Delta, joined to names
 
@@ -384,11 +403,11 @@ one query:
 
 | station_name | community | betweenness | pagerank_rank | minutes_rank |
 |---|---|---|---|---|
-| Queens Plaza North & Crescent St | 532 | 28906.2 | 54 | 72 |
-| Schermerhorn St & Bond St | 245 | 18167.3 | 223 | 303 |
-| W 43 St & 6 Ave | 72 | 15928.2 | 138 | 121 |
-| 45 Rd & 11 St | 532 | 15518.1 | 364 | 405 |
-| Broadway & W 41 St | 72 | 14820.8 | 19 | 18 |
+| Queens Plaza North & Crescent St | 2002 | 28906.2 | 54 | 72 |
+| Schermerhorn St & Bond St | 119 | 18167.3 | 223 | 303 |
+| W 43 St & 6 Ave | 164 | 15928.2 | 138 | 121 |
+| 45 Rd & 11 St | 2002 | 15518.1 | 364 | 405 |
+| Broadway & W 41 St | 164 | 14820.8 | 19 | 18 |
 
 ### A* between two named stations
 

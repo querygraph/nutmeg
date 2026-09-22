@@ -1,6 +1,6 @@
 {
-  "nutmeg commit": "f727f4de9676832d5fa5a7478e8bb07f1e42f5b9",
-  "grust commit": "db00ee7708b7c0d97978b26cf235bab577a88428",
+  "nutmeg commit": "cec30960d4f33dd866693ad437311889b7caa155",
+  "grust commit": "fd4e3ec37fc12a5ab33ede5d5faa182fa277a5c2",
   "sail commit": "f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f",
   "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "host": "Linux 6.12.107+deb13-cloud-amd64 x86_64"
