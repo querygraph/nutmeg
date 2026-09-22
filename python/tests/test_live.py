@@ -80,3 +80,38 @@ def test_nullable_outputs_hold_nulls(nm):
         dist = {r["nodeId"]: r["distance"] for r in frame.collect()}
         assert dist["d"] is None and dist["a"] == 0.0, (algorithm, dist)
     g.drop()
+
+
+def test_the_order_option_reaches_the_server(nm):
+    # The endpoints arrive as c, b, a, 10, 9. A stream serves nodes in the
+    # projection's row order, so it shows which order the server staged in:
+    # canonical (the default, ids compared as text) or as they arrived.
+    spark = nm.spark
+    edges = spark.createDataFrame([("c", "b"), ("b", "a"), ("10", "9")], "src string, dst string")
+
+    def staged_order(name):
+        return [r["nodeId"] for r in nm.pagerank.stream(nm.graph.get(name)).collect()]
+
+    def write(name, order=None):
+        writer = (edges.write.format("nutmeg").option("graph", name).option("part", "edges")
+                  .option("sourceColumn", "src").option("targetColumn", "dst"))
+        if order is not None:
+            writer = writer.option("order", order)
+        writer.mode("overwrite").save()
+
+    canonical = ["10", "9", "a", "b", "c"]
+    arrival = ["c", "b", "a", "10", "9"]
+    nm.graph.project("order_default", edges, source="src", target="dst")
+    assert staged_order("order_default") == canonical
+    nm.graph.project("order_as_staged", edges, source="src", target="dst", order="asStaged")
+    assert staged_order("order_as_staged") == arrival
+    # The option as the server parses it, past the Python client's own check.
+    write("order_explicit", "canonical")
+    assert staged_order("order_explicit") == canonical
+    write("order_upper", "ASSTAGED")
+    assert staged_order("order_upper") == arrival
+    with pytest.raises(Exception, match="nutmeg: `order` is `canonical` or `asStaged`, got `sorted`"):
+        write("order_invalid", "sorted")
+    assert "order_invalid" not in [r["name"] for r in nm.graph.list().collect()]
+    for name in ["order_default", "order_as_staged", "order_explicit", "order_upper"]:
+        nm.graph.get(name).drop()
