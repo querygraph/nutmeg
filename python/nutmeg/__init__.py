@@ -16,6 +16,10 @@ Result columns carry Grust's names unless the client is made with
 `Nutmeg(spark, column_names="gds")`, which renames the ones GDS names
 differently. Results are ordinary lazy DataFrames; `mutate` and `write` are DataFrame
 operations (join, `write.saveAsTable`), not separate modes.
+
+Staged rows are kept in a canonical order by default (`order="canonical"`), so
+a result does not depend on the order Spark happened to deliver the rows in;
+`order="asStaged"` skips the sort. See `_GraphCatalog.project`.
 """
 from __future__ import annotations
 
@@ -88,14 +92,31 @@ class _GraphCatalog:
         edge_id: Optional[str] = None,
         id: Optional[str] = None,
         label: Optional[str] = None,
+        order: str = "canonical",
     ) -> Graph:
         """Stage a graph from DataFrames. Columns named as in grust-arrow
         (`source`, `target`, `label`, `node_id`) or grust-sail's tables
         (`src_id`, `dst_id`, `edge_type`, `id`) are found without naming them.
         Every other numeric edge column becomes selectable as `weightProperty`.
-        Without `nodes`, the nodes are the edges' endpoints."""
+        Without `nodes`, the nodes are the edges' endpoints.
+
+        `order="canonical"` (the default) has the server sort the staged rows:
+        nodes by id, edges by source, target, edge id, type and then every
+        other column. Ids are compared as text, so "10" sorts before "9".
+        Some kernels depend on row order (Leiden, Louvain and label
+        propagation visit nodes in it; others break ties by it), and a
+        DataFrame's row order is not fixed from run to run, so this is what
+        makes the same data give the same result. The cost is one in-memory
+        sort of every staged row on the server. `order="asStaged"` keeps the
+        rows in the order they arrive, for callers who already fix an order
+        or want to skip the sort."""
+        if order not in ("canonical", "asStaged"):
+            raise ValueError(f"order is 'canonical' or 'asStaged', got {order!r}")
+
         def write(df, part, mapping):
             writer = df.write.format(FORMAT).option("graph", name).option("part", part)
+            if order != "canonical":
+                writer = writer.option("order", order)
             for key, column in mapping.items():
                 if column is not None:
                     writer = writer.option(key, column)
@@ -111,10 +132,11 @@ class _GraphCatalog:
         })
         return Graph(self._nutmeg, name)
 
-    def project_grust(self, name: str, weight_properties=()) -> Graph:
+    def project_grust(self, name: str, weight_properties=(), order: str = "canonical") -> Graph:
         """Stage the Grust graph stored in this Sail catalog by grust-sail
         (`grust_nodes`, `grust_edges`). Each name in `weight_properties` is
-        lifted out of the edges' JSON `props` as a numeric column."""
+        lifted out of the edges' JSON `props` as a numeric column. `order` is
+        as for `project`."""
         spark = self._nutmeg.spark
         for key in weight_properties:
             if not key.isidentifier():
@@ -127,7 +149,7 @@ class _GraphCatalog:
             "SELECT id AS edge_id, src_id AS source, dst_id AS target, "
             f"edge_type AS label{lifted} FROM grust_edges"
         )
-        return self.project(name, edges, nodes)
+        return self.project(name, edges, nodes, order=order)
 
     def get(self, name: str) -> Graph:
         return Graph(self._nutmeg, name)

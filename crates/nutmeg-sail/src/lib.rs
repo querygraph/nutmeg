@@ -15,7 +15,10 @@
 //! grust-arrow layout are recognized as they are; other tables name their
 //! columns with `sourceColumn`, `targetColumn`, `typeColumn`, `edgeIdColumn`,
 //! `idColumn`, `labelColumn`. `mode("overwrite")` replaces that part;
-//! `append` adds to it.
+//! `append` adds to it. `order` is `canonical` (the default: the whole part,
+//! appends included, is kept sorted, so results do not depend on the order
+//! Sail's scan delivered the rows in) or `asStaged` (rows kept in arrival
+//! order, with no sort); see `nutmeg_graph::StageOrder`.
 //!
 //! This is the shape of Neo4j's Spark connector `gds` option and of Aura's
 //! project-then-run session, without a database or a second instance: the
@@ -36,7 +39,7 @@ use datafusion_common::{Result, not_impl_err, plan_err};
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableSource, TableType};
 use futures::TryStreamExt;
-use nutmeg_graph::{AlgorithmTable, ColumnMapping, GraphsTable, Part, Registry};
+use nutmeg_graph::{AlgorithmTable, ColumnMapping, GraphsTable, Part, Registry, StageOrder};
 use sail_common_datafusion::datasource::{
     DataSource, DataSourceRegistry, OptionLayer, SinkInfo, SinkMode, SourceInfo,
 };
@@ -135,6 +138,13 @@ impl DataSource for NutmegDataSource {
             other => return plan_err!("nutmeg: `part` must be `nodes` or `edges`, got `{other}`"),
         };
         take(&mut options, "path");
+        let order = match take(
+            &mut options,
+            &nutmeg_graph::ORDER_OPTION.to_ascii_lowercase(),
+        ) {
+            Some(text) => StageOrder::parse(&text)?,
+            None => StageOrder::Canonical,
+        };
         let mut mapping = ColumnMapping::default();
         for (key, value) in options {
             if !mapping.set(&key, value) {
@@ -155,6 +165,7 @@ impl DataSource for NutmegDataSource {
             part,
             mapping,
             replace,
+            order,
             schema: Arc::new(input.schema().as_arrow().clone()),
         });
         let plan = LogicalPlanBuilder::insert_into(
@@ -176,6 +187,7 @@ struct StageSink {
     part: Part,
     mapping: ColumnMapping,
     replace: bool,
+    order: StageOrder,
     schema: arrow::datatypes::SchemaRef,
 }
 
@@ -215,6 +227,7 @@ impl TableProvider for StageSink {
             part: self.part,
             mapping: self.mapping.clone(),
             replace: self.replace,
+            order: self.order,
             schema: self.schema.clone(),
         };
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
@@ -231,6 +244,7 @@ struct StageWriter {
     part: Part,
     mapping: ColumnMapping,
     replace: bool,
+    order: StageOrder,
     schema: arrow::datatypes::SchemaRef,
 }
 
@@ -258,6 +272,7 @@ impl DataSink for StageWriter {
             &batches,
             &self.mapping,
             self.replace,
+            self.order,
         )?;
         Ok(rows as u64)
     }

@@ -533,19 +533,19 @@ def main() -> int:
     # ---------------------------------------------------- Leiden communities
     report.h(3, "Station communities (Leiden)")
     # Leiden visits nodes in projection row order (shuffled by `seed`), and the
-    # row order follows the order edges are staged in. Sail's scan of the Delta
-    # table does not fix that order from run to run, so the trips are staged
-    # sorted: the same rows as the tutorial's graph, in a reproducible order.
-    stage_edges(spark.sql("SELECT start_station_id AS source, end_station_id AS target FROM bike_trips "
-                          "ORDER BY start_station_id, end_station_id"), "trips_sorted", "source", "target")
-    (run(spark, "trips_sorted", "leiden", orientation="undirected", seed=LEIDEN_SEED)
+    # row order follows the order the rows are staged in. Sail's scan of the
+    # Delta table does not fix that order from run to run, so this script used
+    # to stage the trips a second time, sorted by station. Nutmeg now keeps
+    # every staged graph in a canonical order by default (the write option
+    # `order`), so the tutorial's graph from Step 2 is reproducible as it is.
+    (run(spark, "bike_trips", "leiden", orientation="undirected", seed=LEIDEN_SEED)
         .write.format("delta").mode("overwrite").save(delta("station_communities")))
     spark.read.format("delta").load(delta("station_communities")).createOrReplaceTempView("leiden")
     leiden = spark.table("leiden")
     lmeta = spark.sql("SELECT COUNT(DISTINCT communityId) AS communities, MAX(modularity) AS modularity, "
                       "MAX(levels) AS levels, MIN(CAST(converged AS INT)) AS converged FROM leiden").toPandas()
-    report.emit("Leiden on the tutorial's trips (every trip one undirected edge of weight 1; staged sorted by "
-                f"station so the node order, and so the result, is reproducible), seed {LEIDEN_SEED}, "
+    report.emit("Leiden on the tutorial's trips (every trip one undirected edge of weight 1; Nutmeg stages "
+                f"rows in canonical order, so the node order, and so the result, is reproducible), seed {LEIDEN_SEED}, "
                 "written to `delta/station_communities`:")
     report.emit()
     report.table(lmeta, floatfmt="{:.9f}")

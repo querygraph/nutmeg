@@ -1,5 +1,6 @@
 use super::*;
 use arrow::array::{Float64Array, Int32Array};
+use std::collections::BTreeSet;
 
 fn edges(source: &[&str], target: &[&str], weight: Option<&[f64]>) -> RecordBatch {
     let mut fields = vec![
@@ -175,6 +176,7 @@ fn projections_are_cached_per_option_set_and_dropped_on_restage() {
         &[edges(&["a", "b"], &["b", "c"], None)],
         &mapping,
         true,
+        StageOrder::Canonical,
     )
     .unwrap();
     let directed = validate("wcc", &no_options()).unwrap();
@@ -198,6 +200,7 @@ fn projections_are_cached_per_option_set_and_dropped_on_restage() {
         &[edges(&["c"], &["d"], None)],
         &mapping,
         false,
+        StageOrder::Canonical,
     )
     .unwrap();
     assert_eq!(info(name).projections, 0);
@@ -214,13 +217,22 @@ fn explicit_nodes_make_unknown_endpoints_an_error() {
     )
     .unwrap();
     let mapping = ColumnMapping::default();
-    Registry::stage(name, Part::Nodes, &[nodes], &mapping, true).unwrap();
+    Registry::stage(
+        name,
+        Part::Nodes,
+        &[nodes],
+        &mapping,
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
     Registry::stage(
         name,
         Part::Edges,
         &[edges(&["1"], &["9"], None)],
         &mapping,
         true,
+        StageOrder::Canonical,
     )
     .unwrap();
     let error = Registry::projection(name, &validate("degree", &no_options()).unwrap())
@@ -234,6 +246,7 @@ fn explicit_nodes_make_unknown_endpoints_an_error() {
         &[edges(&["1"], &["2"], None)],
         &mapping,
         true,
+        StageOrder::Canonical,
     )
     .unwrap();
     Registry::projection(name, &validate("degree", &no_options()).unwrap()).unwrap();
@@ -251,6 +264,7 @@ async fn every_algorithm_runs_through_sql() -> Result<()> {
         )],
         &ColumnMapping::default(),
         true,
+        StageOrder::Canonical,
     )?;
     let ctx = SessionContext::new();
     register(&ctx);
@@ -382,7 +396,15 @@ fn staged_node_columns_reach_the_kernels_that_read_them() {
     )
     .unwrap();
     let mapping = ColumnMapping::default();
-    Registry::stage(name, Part::Nodes, &[nodes], &mapping, true).unwrap();
+    Registry::stage(
+        name,
+        Part::Nodes,
+        &[nodes],
+        &mapping,
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
     Registry::stage(
         name,
         Part::Edges,
@@ -393,6 +415,7 @@ fn staged_node_columns_reach_the_kernels_that_read_them() {
         )],
         &mapping,
         true,
+        StageOrder::Canonical,
     )
     .unwrap();
 
@@ -534,6 +557,7 @@ async fn gds_names_are_chosen_per_read_and_grust_names_stay_reachable() -> Resul
         &[edges(&["a", "b", "a"], &["b", "c", "c"], None)],
         &ColumnMapping::default(),
         true,
+        StageOrder::Canonical,
     )?;
     let ctx = SessionContext::new();
     register(&ctx);
@@ -604,13 +628,22 @@ fn link_prediction_and_all_pairs_serve_their_values() {
     )
     .unwrap();
     let mapping = ColumnMapping::default();
-    Registry::stage(name, Part::Nodes, &[nodes], &mapping, true).unwrap();
+    Registry::stage(
+        name,
+        Part::Nodes,
+        &[nodes],
+        &mapping,
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
     Registry::stage(
         name,
         Part::Edges,
         &[edges(&["a", "b", "c"], &["b", "c", "d"], None)],
         &mapping,
         true,
+        StageOrder::Canonical,
     )
     .unwrap();
     let scores = |metric: &str| {
@@ -724,7 +757,15 @@ fn declared_nullable_outputs_are_nullable_whatever_the_rows_hold() {
     )
     .unwrap();
     let mapping = ColumnMapping::default();
-    Registry::stage(name, Part::Nodes, &[nodes], &mapping, true).unwrap();
+    Registry::stage(
+        name,
+        Part::Nodes,
+        &[nodes],
+        &mapping,
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
     Registry::stage(
         name,
         Part::Edges,
@@ -735,6 +776,7 @@ fn declared_nullable_outputs_are_nullable_whatever_the_rows_hold() {
         )],
         &mapping,
         true,
+        StageOrder::Canonical,
     )
     .unwrap();
 
@@ -836,6 +878,7 @@ fn declared_nullable_outputs_are_nullable_whatever_the_rows_hold() {
         )],
         &mapping,
         true,
+        StageOrder::Canonical,
     )
     .unwrap();
     for (kernel, options, column) in [
@@ -873,4 +916,704 @@ fn declared_nullable_outputs_are_nullable_whatever_the_rows_hold() {
     }
     assert!(Registry::drop(name).unwrap());
     assert!(Registry::drop(full).unwrap());
+}
+
+// ------------------------------------------------------------ canonical order
+
+/// A small deterministic generator, so a fixture is the same on every run
+/// and needs no dependency.
+struct Mix(u64);
+
+impl Mix {
+    fn next(&mut self) -> u64 {
+        // SplitMix64.
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    fn shuffle<T>(&mut self, items: &mut [T]) {
+        for i in (1..items.len()).rev() {
+            items.swap(i, self.below(i + 1));
+        }
+    }
+}
+
+/// Three planted communities of ten nodes, dense inside and sparse between.
+/// Ids sort differently as text and as numbers (`"10"` before `"9"`), and
+/// include the probe's `a`, `b`, `c`, which every kernel's probe arguments
+/// name. Every node carries a column for each property option any registered
+/// kernel declares ([`probe_key`]). Edges carry a weight `w`, and every
+/// seventh pair is joined a second time with a different weight and no
+/// `edge_id`, so the tie-break past `source`, `target` is exercised.
+struct Fixture {
+    /// (id, community) per node.
+    nodes: Vec<(String, i64)>,
+    /// (source, target, w) per edge.
+    edges: Vec<(String, String, f64)>,
+}
+
+fn fixture() -> Fixture {
+    let mut mix = Mix(7);
+    let mut ids: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+    ids.extend((1..=27).map(|i| i.to_string()));
+    let nodes: Vec<(String, i64)> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.clone(), (i / 10) as i64))
+        .collect();
+    let mut edges = Vec::new();
+    for (i, (u, cu)) in nodes.iter().enumerate() {
+        for (j, (v, cv)) in nodes.iter().enumerate() {
+            let chance = if cu == cv { 30 } else { 3 };
+            if i != j && mix.below(100) < chance {
+                edges.push((u.clone(), v.clone(), (1 + mix.below(5)) as f64));
+            }
+        }
+    }
+    let parallel: Vec<_> = edges.iter().step_by(7).cloned().collect();
+    for (u, v, w) in parallel {
+        edges.push((u, v, w + 0.5));
+    }
+    Fixture { nodes, edges }
+}
+
+/// Split `order` into consecutive runs of the given sizes.
+fn runs<'a>(order: &'a [usize], sizes: &[usize]) -> Vec<&'a [usize]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for &size in sizes {
+        out.push(&order[start..start + size]);
+        start += size;
+    }
+    out
+}
+
+impl Fixture {
+    /// Node rows in `order`, as batches of the given sizes.
+    fn node_batches(&self, order: &[usize], sizes: &[usize]) -> Vec<RecordBatch> {
+        runs(order, sizes)
+            .into_iter()
+            .map(|rows| self.node_batch(rows))
+            .collect()
+    }
+
+    fn node_batch(&self, rows: &[usize]) -> RecordBatch {
+        let community = |i: &usize| self.nodes[*i].1;
+        let mut fields = vec![Field::new("id", DataType::Utf8, false)];
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(
+            rows.iter()
+                .map(|i| self.nodes[*i].0.as_str())
+                .collect::<Vec<_>>(),
+        ))];
+        let mut seen = HashSet::new();
+        for name in grust_algorithm_procedures::projection_kernel_names() {
+            for declared in grust_algorithm_procedures::node_property_options(name).unwrap() {
+                let key = probe_key(declared.option, declared.kind);
+                if !seen.insert(key.clone()) {
+                    continue;
+                }
+                let values: ArrayRef =
+                    match declared.kind {
+                        PropertyKind::Number => Arc::new(Float64Array::from(
+                            rows.iter()
+                                .map(|i| (*i as f64 * 7.0) % 90.0)
+                                .collect::<Vec<_>>(),
+                        )),
+                        PropertyKind::Integer => Arc::new(Int64Array::from(
+                            rows.iter().map(community).collect::<Vec<_>>(),
+                        )),
+                        PropertyKind::Category => Arc::new(StringArray::from(
+                            rows.iter()
+                                .map(|i| ["x", "y", "z"][community(i) as usize])
+                                .collect::<Vec<_>>(),
+                        )),
+                        PropertyKind::Vector => Arc::new(
+                            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                                rows.iter().map(|i| {
+                                    let c = community(i) as f32;
+                                    Some(vec![Some(1.0 + c), Some(1.0 + (*i % 3) as f32)])
+                                }),
+                                2,
+                            ),
+                        ),
+                    };
+                fields.push(Field::new(&key, values.data_type().clone(), true));
+                columns.push(values);
+            }
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    /// Edge rows in `order`, as batches of the given sizes.
+    fn edge_batches(&self, order: &[usize], sizes: &[usize]) -> Vec<RecordBatch> {
+        runs(order, sizes)
+            .into_iter()
+            .map(|rows| {
+                let source: Vec<&str> = rows.iter().map(|i| self.edges[*i].0.as_str()).collect();
+                let target: Vec<&str> = rows.iter().map(|i| self.edges[*i].1.as_str()).collect();
+                let w: Vec<f64> = rows.iter().map(|i| self.edges[*i].2).collect();
+                edges(&source, &target, Some(&w))
+            })
+            .collect()
+    }
+}
+
+/// `n` positions shuffled by `seed`, and batch sizes, also drawn from `seed`,
+/// that cover them.
+fn arrival(n: usize, seed: u64) -> (Vec<usize>, Vec<usize>) {
+    let mut mix = Mix(seed);
+    let mut order: Vec<usize> = (0..n).collect();
+    mix.shuffle(&mut order);
+    let mut sizes = Vec::new();
+    let mut left = n;
+    while left > 0 {
+        let size = (1 + mix.below(n / 3 + 1)).min(left);
+        sizes.push(size);
+        left -= size;
+    }
+    (order, sizes)
+}
+
+/// Every cell of every result row as text, rows in the order they came: two
+/// runs are identical exactly when these are equal. Floats print at full
+/// round-trip precision, so a difference in the last bit shows. A failed run
+/// is compared by its message.
+fn rendered(result: Result<Vec<RecordBatch>>) -> Vec<String> {
+    let batches = match result {
+        Ok(batches) => batches,
+        Err(error) => return vec![format!("error: {error}")],
+    };
+    let options = arrow::util::display::FormatOptions::default().with_null("null");
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let formatters: Vec<_> = batch
+            .columns()
+            .iter()
+            .map(|c| arrow::util::display::ArrayFormatter::try_new(c.as_ref(), &options).unwrap())
+            .collect();
+        for row in 0..batch.num_rows() {
+            let cells: Vec<String> = formatters
+                .iter()
+                .map(|f| f.value(row).to_string())
+                .collect();
+            rows.push(cells.join(" | "));
+        }
+    }
+    rows
+}
+
+/// Every registered kernel with its probe arguments (which name nodes `a`,
+/// `b`, `c` and the fixture's property columns), on the outgoing and the
+/// undirected projection, unweighted and weighted by `w`. A combination
+/// Grust's validator refuses is left out; one that fails when run is kept,
+/// and compared by its error.
+fn calls() -> Vec<(String, &'static str, ValidatedArguments)> {
+    let mut out = Vec::new();
+    for algorithm in algorithm_names() {
+        for orientation in ["outgoing", "undirected"] {
+            for weighted in [false, true] {
+                let mut options = serde_json::Map::new();
+                options.insert("orientation".into(), serde_json::json!(orientation));
+                if weighted {
+                    options.insert("weightProperty".into(), serde_json::json!("w"));
+                }
+                if let Ok(args) = probe_args_with(algorithm, options) {
+                    let weight = if weighted { "weighted" } else { "unweighted" };
+                    out.push((
+                        format!("{algorithm} {orientation} {weight}"),
+                        algorithm,
+                        args,
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Stage the fixture under `name` in the arrival order drawn from `seed`: its
+/// nodes (unless `edges_only`) in one write, and its edges in one write per
+/// batch when `appends`, the first replacing and the rest appending.
+fn stage_fixture(
+    name: &str,
+    fixture: &Fixture,
+    seed: u64,
+    edges_only: bool,
+    appends: bool,
+    order: StageOrder,
+) {
+    let mapping = ColumnMapping::default();
+    if edges_only {
+        Registry::stage(name, Part::Nodes, &[], &mapping, true, order).unwrap();
+    } else {
+        let (rows, sizes) = arrival(fixture.nodes.len(), seed);
+        let batches = fixture.node_batches(&rows, &sizes);
+        Registry::stage(name, Part::Nodes, &batches, &mapping, true, order).unwrap();
+    }
+    let (rows, sizes) = arrival(fixture.edges.len(), seed.wrapping_mul(31));
+    let batches = fixture.edge_batches(&rows, &sizes);
+    if appends {
+        for (i, batch) in batches.iter().enumerate() {
+            Registry::stage(
+                name,
+                Part::Edges,
+                std::slice::from_ref(batch),
+                &mapping,
+                i == 0,
+                order,
+            )
+            .unwrap();
+        }
+    } else {
+        Registry::stage(name, Part::Edges, &batches, &mapping, true, order).unwrap();
+    }
+}
+
+type Calls = [(String, &'static str, ValidatedArguments)];
+
+/// Each call's rendered result on `name`.
+fn results(name: &str, calls: &Calls) -> Vec<Vec<String>> {
+    calls
+        .iter()
+        .map(|(_, algorithm, args)| rendered(run(algorithm, name, args)))
+        .collect()
+}
+
+/// Stage the fixture under a fresh name, collect every call's result, drop it.
+fn staged_results(
+    calls: &Calls,
+    seed: u64,
+    edges_only: bool,
+    appends: bool,
+    order: StageOrder,
+) -> Vec<Vec<String>> {
+    let name = format!("order-{order:?}-{seed}-{edges_only}-{appends}");
+    stage_fixture(&name, &fixture(), seed, edges_only, appends, order);
+    let out = results(&name, calls);
+    assert!(Registry::drop(&name).unwrap());
+    out
+}
+
+/// The kernels with a call whose values differ between two stagings, compared
+/// as multisets of rows: a different row order alone does not count, only
+/// different values.
+fn differing(calls: &Calls, left: &[Vec<String>], right: &[Vec<String>]) -> BTreeSet<&'static str> {
+    let sorted = |rows: &Vec<String>| {
+        let mut rows = rows.clone();
+        rows.sort();
+        rows
+    };
+    calls
+        .iter()
+        .zip(left.iter().zip(right))
+        .filter(|(_, (l, r))| sorted(l) != sorted(r))
+        .map(|((_, algorithm, _), _)| *algorithm)
+        .collect()
+}
+
+/// The modularity `algorithm` (Leiden or Louvain) reaches on the fixture staged
+/// in the arrival order drawn from `seed`: a measure of the partition found,
+/// so a difference in it is a different answer, not a relabelling.
+fn modularity_reached(
+    algorithm: &str,
+    seed: u64,
+    edges_only: bool,
+    appends: bool,
+    order: StageOrder,
+) -> f64 {
+    let name = format!("modularity-{algorithm}-{order:?}-{seed}-{edges_only}-{appends}");
+    stage_fixture(&name, &fixture(), seed, edges_only, appends, order);
+    let mut options = serde_json::Map::new();
+    options.insert("orientation".into(), serde_json::json!("undirected"));
+    let batches = run(algorithm, &name, &validate(algorithm, &options).unwrap()).unwrap();
+    assert!(Registry::drop(&name).unwrap());
+    batches[0]
+        .column_by_name("modularity")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .value(0)
+}
+
+/// The same graph staged in different orders gives identical results, row for
+/// row and bit for bit, for every kernel Grust registers, under canonical
+/// order; and as staged, it does not.
+///
+/// Each staging shuffles the fixture's node and edge rows and splits them
+/// into batches of random sizes. Every kernel runs with its probe arguments,
+/// outgoing and undirected, unweighted and weighted: 164 calls on the Grust
+/// this was written against, each compared in full, including the edge
+/// ordinals path kernels report and the text of any error. It runs twice:
+/// with the nodes staged, and with edges alone, where the nodes are derived
+/// from the edges, as the Citi Bike example stages its trips.
+///
+/// The second half is what shows the sort is doing the work. Staged as they
+/// arrived, the same three orders change Leiden's, Louvain's and label
+/// propagation's answers, and Leiden and Louvain reach a different modularity
+/// in four orders (0.5026 in some, 0.5248 in others): a different partition,
+/// not the same one relabelled. Canonically staged, the same four orders all
+/// reach one. Without the sort, the first half fails the same way.
+#[test]
+fn canonical_order_makes_every_kernel_independent_of_arrival_order() {
+    let calls = calls();
+    assert!(calls.len() >= 100, "{} calls", calls.len());
+    for edges_only in [false, true] {
+        let canonical: Vec<_> = [1, 2, 3]
+            .map(|seed| staged_results(&calls, seed, edges_only, false, StageOrder::Canonical))
+            .into();
+        let succeeded = canonical[0]
+            .iter()
+            .filter(|rows| !rows.iter().any(|row| row.starts_with("error:")))
+            .count();
+        assert!(
+            succeeded * 2 > calls.len(),
+            "only {succeeded} of {} calls ran; the comparison would be of errors",
+            calls.len()
+        );
+        for (i, (label, _, _)) in calls.iter().enumerate() {
+            for other in &canonical[1..] {
+                assert_eq!(
+                    canonical[0][i], other[i],
+                    "{label} (edges only: {edges_only})"
+                );
+            }
+        }
+
+        let as_staged: Vec<_> = [1, 2, 3]
+            .map(|seed| staged_results(&calls, seed, edges_only, false, StageOrder::AsStaged))
+            .into();
+        let mut sensitive = BTreeSet::new();
+        for other in &as_staged[1..] {
+            sensitive.extend(differing(&calls, &as_staged[0], other));
+        }
+        for kernel in ["leiden", "louvain", "labelPropagation"] {
+            assert!(
+                sensitive.contains(kernel),
+                "{kernel} gave the same values in every arrival order as staged, so this \
+                 fixture does not show what the sort is for (edges only: {edges_only}); \
+                 sensitive: {sensitive:?}"
+            );
+        }
+    }
+    for algorithm in ["leiden", "louvain"] {
+        for edges_only in [false, true] {
+            let reached = |order| -> BTreeSet<u64> {
+                [1, 2, 3, 4]
+                    .map(|seed| {
+                        modularity_reached(algorithm, seed, edges_only, false, order).to_bits()
+                    })
+                    .into()
+            };
+            let context = format!("{algorithm} (edges only: {edges_only})");
+            assert_eq!(reached(StageOrder::Canonical).len(), 1, "{context}");
+            assert!(reached(StageOrder::AsStaged).len() > 1, "{context}");
+        }
+    }
+}
+
+/// Canonical order covers the whole part, not each write: the edges staged in
+/// one write, or appended a batch at a time in two different orders, give the
+/// same results for every call. As staged, the appends give different
+/// answers. A canonical append after an as-staged write sorts the rows that
+/// write left too.
+#[test]
+fn canonical_order_covers_the_whole_part_across_appends() {
+    let calls = calls();
+    let whole = staged_results(&calls, 1, true, false, StageOrder::Canonical);
+    for seed in [4, 5] {
+        let appended = staged_results(&calls, seed, true, true, StageOrder::Canonical);
+        for (i, (label, _, _)) in calls.iter().enumerate() {
+            assert_eq!(whole[i], appended[i], "{label} (appends from seed {seed})");
+        }
+    }
+    let left = staged_results(&calls, 4, true, true, StageOrder::AsStaged);
+    let right = staged_results(&calls, 5, true, true, StageOrder::AsStaged);
+    let sensitive = differing(&calls, &left, &right);
+    assert!(
+        sensitive.contains("leiden") && sensitive.contains("louvain"),
+        "{sensitive:?}"
+    );
+    let reached: BTreeSet<u64> = [4, 5, 6]
+        .map(|seed| modularity_reached("leiden", seed, true, true, StageOrder::AsStaged).to_bits())
+        .into();
+    assert!(
+        reached.len() > 1,
+        "as staged, appends reached one modularity"
+    );
+
+    // An as-staged write, then a canonical append: the whole part is sorted.
+    let name = "order-mixed";
+    let fixture = fixture();
+    let mapping = ColumnMapping::default();
+    let (rows, sizes) = arrival(fixture.edges.len(), 9);
+    let batches = fixture.edge_batches(&rows, &sizes);
+    let (first, rest) = batches.split_at(batches.len() / 2);
+    Registry::stage(name, Part::Nodes, &[], &mapping, true, StageOrder::AsStaged).unwrap();
+    Registry::stage(
+        name,
+        Part::Edges,
+        first,
+        &mapping,
+        true,
+        StageOrder::AsStaged,
+    )
+    .unwrap();
+    Registry::stage(
+        name,
+        Part::Edges,
+        rest,
+        &mapping,
+        false,
+        StageOrder::Canonical,
+    )
+    .unwrap();
+    let mixed = results(name, &calls);
+    assert!(Registry::drop(name).unwrap());
+    for (i, (label, _, _)) in calls.iter().enumerate() {
+        assert_eq!(
+            whole[i], mixed[i],
+            "{label} (as staged, then a canonical append)"
+        );
+    }
+}
+
+fn staged(name: &str, part: Part) -> Vec<RecordBatch> {
+    let entry = Registry::entry(name, false).unwrap().unwrap();
+    let e = entry.read().unwrap();
+    match part {
+        Part::Nodes => e.nodes.clone(),
+        Part::Edges => e.edges.clone(),
+    }
+}
+
+fn strings_of(batches: &[RecordBatch], column: &str) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let c = b
+                .column_by_name(column)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone();
+            (0..c.len()).map(move |i| c.value(i).to_string())
+        })
+        .collect()
+}
+
+/// Ids are Utf8 once staged, so canonical order is text order: `"10"` sorts
+/// before `"9"`, for staged nodes and for nodes derived from edges alike.
+/// Parallel edges with no `edge_id` are ordered by their weight.
+#[test]
+fn canonical_order_is_text_order_on_ids_and_breaks_ties_by_the_other_columns() {
+    let name = "text-order";
+    let mapping = ColumnMapping::default();
+    let nodes = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![9, 10, 2]))],
+    )
+    .unwrap();
+    Registry::stage(
+        name,
+        Part::Nodes,
+        &[nodes],
+        &mapping,
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
+    assert_eq!(
+        strings_of(&staged(name, Part::Nodes), "node_id"),
+        ["10", "2", "9"]
+    );
+    let batch = edges(
+        &["9", "9", "10", "9"],
+        &["2", "2", "9", "10"],
+        Some(&[3.0, 1.0, 5.0, 2.0]),
+    );
+    Registry::stage(
+        name,
+        Part::Edges,
+        std::slice::from_ref(&batch),
+        &mapping,
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
+    let sorted = staged(name, Part::Edges);
+    assert_eq!(strings_of(&sorted, "source"), ["10", "9", "9", "9"]);
+    assert_eq!(strings_of(&sorted, "target"), ["9", "10", "2", "2"]);
+    let w = sorted[0]
+        .column_by_name("property.w")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(w.values().to_vec(), [5.0, 2.0, 1.0, 3.0]);
+
+    Registry::stage(
+        name,
+        Part::Nodes,
+        &[],
+        &mapping,
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
+    assert_eq!(
+        strings_of(&Registry::node_batches(name).unwrap(), "node_id"),
+        ["10", "2", "9"]
+    );
+    // As staged, rows keep their arrival order, and derived nodes the order
+    // their ids first appear.
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[batch],
+        &mapping,
+        true,
+        StageOrder::AsStaged,
+    )
+    .unwrap();
+    assert_eq!(
+        strings_of(&staged(name, Part::Edges), "source"),
+        ["9", "9", "10", "9"]
+    );
+    assert_eq!(
+        strings_of(&Registry::node_batches(name).unwrap(), "node_id"),
+        ["9", "2", "10"]
+    );
+    assert!(Registry::drop(name).unwrap());
+}
+
+/// Appends of differently shaped rows are sorted as one part: a batch without
+/// the weight column is filled as Grust reads a missing column (absent), so
+/// the two appends in either order stage the same rows. A column that is two
+/// types in two appends has no single sorted form and is refused, naming the
+/// opt-out, which accepts it.
+#[test]
+fn appends_of_different_shapes_are_sorted_as_one_part() {
+    let mapping = ColumnMapping::default();
+    let weighted = edges(&["b", "a"], &["c", "b"], Some(&[2.0, 1.0]));
+    let bare = edges(&["a", "c"], &["c", "a"], None);
+    let mut seen = Vec::new();
+    for (name, batches) in [
+        ("shapes-1", [&weighted, &bare]),
+        ("shapes-2", [&bare, &weighted]),
+    ] {
+        Registry::stage(
+            name,
+            Part::Edges,
+            &[batches[0].clone()],
+            &mapping,
+            true,
+            StageOrder::Canonical,
+        )
+        .unwrap();
+        Registry::stage(
+            name,
+            Part::Edges,
+            &[batches[1].clone()],
+            &mapping,
+            false,
+            StageOrder::Canonical,
+        )
+        .unwrap();
+        let mut options = no_options();
+        options.insert("weightProperty".into(), serde_json::json!("w"));
+        options.insert("defaultWeight".into(), serde_json::json!(7.0));
+        let degree = rendered(run("degree", name, &validate("degree", &options).unwrap()));
+        seen.push((staged(name, Part::Edges), degree));
+        assert!(Registry::drop(name).unwrap());
+    }
+    assert_eq!(seen[0], seen[1]);
+    let present = seen[0].0[0]
+        .column_by_name("present.w")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap()
+        .iter()
+        .collect::<Vec<_>>();
+    // a→b (w 1), a→c (none), b→c (w 2), c→a (none).
+    assert_eq!(present, [Some(true), Some(false), Some(true), Some(false)]);
+
+    let name = "shapes-conflict";
+    let integer = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("src", DataType::Utf8, false),
+            Field::new("dst", DataType::Utf8, false),
+            Field::new("w", DataType::Int32, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(StringArray::from(vec!["b"])),
+            Arc::new(Int32Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[weighted],
+        &mapping,
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
+    let error = Registry::stage(
+        name,
+        Part::Edges,
+        std::slice::from_ref(&integer),
+        &mapping,
+        false,
+        StageOrder::Canonical,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("property.w") && error.contains("asStaged"),
+        "{error}"
+    );
+    // The refused write left the rows staged before it.
+    assert_eq!(strings_of(&staged(name, Part::Edges), "source"), ["a", "b"]);
+    let staged_rows = Registry::stage(
+        name,
+        Part::Edges,
+        &[integer],
+        &mapping,
+        false,
+        StageOrder::AsStaged,
+    )
+    .unwrap();
+    assert_eq!(staged_rows, 3);
+    assert!(Registry::drop(name).unwrap());
+}
+
+#[test]
+fn the_order_option_parses_in_either_case() {
+    assert_eq!(
+        StageOrder::parse("canonical").unwrap(),
+        StageOrder::Canonical
+    );
+    assert_eq!(StageOrder::parse("asStaged").unwrap(), StageOrder::AsStaged);
+    assert_eq!(
+        StageOrder::parse(" ASSTAGED ").unwrap(),
+        StageOrder::AsStaged
+    );
+    assert_eq!(StageOrder::default(), StageOrder::Canonical);
+    let error = StageOrder::parse("sorted").unwrap_err().to_string();
+    assert!(
+        error.contains(ORDER_OPTION) && error.contains("asStaged"),
+        "{error}"
+    );
 }

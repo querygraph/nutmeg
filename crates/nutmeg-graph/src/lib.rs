@@ -30,9 +30,10 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float64Array, Int64Array, StringArray,
     new_null_array,
 };
-use arrow::compute::{cast, is_not_null};
+use arrow::compute::{SortOptions, cast, interleave, is_not_null};
 use arrow::datatypes::{DataType, Field, Float32Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use arrow::row::{RowConverter, Rows, SortField};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunction, TableFunctionImpl, TableProvider};
 use datafusion::datasource::MemTable;
@@ -493,11 +494,218 @@ pub fn normalize_edges(batch: &RecordBatch, mapping: &ColumnMapping) -> Result<R
     )?)
 }
 
+/// The row order a staged part is kept in.
+///
+/// Grust's kernels are deterministic for a given input, but the input
+/// includes its order: projection rows follow the order nodes are staged (or,
+/// for an edges-only graph, the order their ids first appear among the
+/// edges), adjacency follows edge order, and Leiden, Louvain and label
+/// propagation visit nodes, and break ties, in that order. A DataFrame's rows
+/// have no order Spark promises, and Sail's scan order changes from run to
+/// run, so the same query staged twice could give two different results.
+///
+/// `Canonical`, the default, keeps each part sorted by a total order on its
+/// rows, over the whole part, appends included, so what a kernel sees is a
+/// function of the set of rows staged and never of the order they arrived in:
+///
+/// - nodes by `node_id`. Ids are unique in any graph a projection accepts
+///   (Grust refuses a duplicate), so this is total on every graph that runs.
+/// - edges by `source`, `target`, `edge_id` (null last), `label`, then every
+///   other column, by column name. Two edges that tie on all of those are
+///   equal in every column a kernel can read, so the sorted part is the same
+///   whichever of them came first: without an `edge_id`, parallel edges
+///   differing only in weight are still ordered, by weight.
+///
+/// Ids are Utf8 once staged, so the order is lexicographic: `"10"` sorts
+/// before `"9"`. That is still a total order, which is all determinism needs;
+/// no kernel reads the order as a numeric one.
+///
+/// `AsStaged` keeps rows in arrival order, as before: for callers that already
+/// stage in an order of their own, or want to skip the sort.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StageOrder {
+    #[default]
+    Canonical,
+    AsStaged,
+}
+
+/// The write option, and Python client keyword, that chooses [`StageOrder`].
+pub const ORDER_OPTION: &str = "order";
+
+impl StageOrder {
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "canonical" => Ok(Self::Canonical),
+            "asstaged" => Ok(Self::AsStaged),
+            other => {
+                plan_err!("nutmeg: `{ORDER_OPTION}` is `canonical` or `asStaged`, got `{other}`")
+            }
+        }
+    }
+}
+
+/// Rows per batch of a sorted part.
+const SORTED_BATCH_ROWS: usize = 64 * 1024;
+
+/// Rewrite a whole part in canonical order (see [`StageOrder`]). The batches
+/// are brought to one schema first ([`unify`]); the sort is a permutation of
+/// (batch, row) positions compared through Arrow's row format, and the rows
+/// are then gathered into batches of [`SORTED_BATCH_ROWS`], so no column is
+/// ever concatenated past Arrow's 32-bit offsets.
+fn canonicalize(part: Part, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    let batches: Vec<RecordBatch> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
+    if batches.is_empty() {
+        return Ok(batches);
+    }
+    let batches = unify(batches)?;
+    let schema = batches[0].schema();
+    let structural: &[&str] = match part {
+        Part::Nodes => &["node_id"],
+        Part::Edges => &["source", "target", "edge_id", "label"],
+    };
+    let mut key: Vec<usize> = structural
+        .iter()
+        .map(|name| schema.index_of(name))
+        .collect::<std::result::Result<_, _>>()?;
+    if part == Part::Edges {
+        let mut rest: Vec<(&str, usize)> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(index, field)| {
+                !key.contains(index)
+                    && RowConverter::supports_fields(&[SortField::new(field.data_type().clone())])
+            })
+            .map(|(index, field)| (field.name().as_str(), index))
+            .collect();
+        rest.sort();
+        key.extend(rest.into_iter().map(|(_, index)| index));
+    }
+    let converter = RowConverter::new(
+        key.iter()
+            .map(|&index| {
+                SortField::new_with_options(
+                    schema.field(index).data_type().clone(),
+                    SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    },
+                )
+            })
+            .collect(),
+    )?;
+    let rows: Vec<Rows> = batches
+        .iter()
+        .map(|batch| {
+            let columns: Vec<ArrayRef> = key.iter().map(|&i| batch.column(i).clone()).collect();
+            converter.convert_columns(&columns)
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let mut order: Vec<(usize, usize)> = batches
+        .iter()
+        .enumerate()
+        .flat_map(|(b, batch)| (0..batch.num_rows()).map(move |r| (b, r)))
+        .collect();
+    // Unstable is enough: rows that compare equal are equal in every column
+    // the key covers, and those are all the columns a kernel reads.
+    order.sort_unstable_by(|x, y| rows[x.0].row(x.1).cmp(&rows[y.0].row(y.1)));
+    drop(rows);
+    let mut out = Vec::with_capacity(order.len().div_ceil(SORTED_BATCH_ROWS));
+    for chunk in order.chunks(SORTED_BATCH_ROWS) {
+        let columns = (0..schema.fields().len())
+            .map(|c| {
+                let arrays: Vec<&dyn Array> =
+                    batches.iter().map(|b| b.column(c).as_ref()).collect();
+                interleave(&arrays, chunk)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        out.push(RecordBatch::try_new(schema.clone(), columns)?);
+    }
+    Ok(out)
+}
+
+/// Bring a part's batches to one schema, so they can be sorted together.
+/// Staged batches normally share one already; appends of differently shaped
+/// DataFrames need not. A column missing from a batch is added as Grust would
+/// read its absence: a `present.*` column as all false, anything else (a
+/// `property.*` column) as all null. A column name that means two data types,
+/// or appears twice in one batch, has no single sorted form and is refused.
+fn unify(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    let first = batches[0].schema();
+    if batches
+        .iter()
+        .all(|b| b.schema().fields() == first.fields())
+    {
+        return Ok(batches);
+    }
+    let mut fields: Vec<Field> = Vec::new();
+    for batch in &batches {
+        let schema = batch.schema();
+        let mut names = HashSet::new();
+        for field in schema.fields() {
+            if !names.insert(field.name().as_str()) {
+                return plan_err!(
+                    "nutmeg: column `{}` appears twice; canonical order cannot sort it \
+                     (stage with `{ORDER_OPTION}` = `asStaged`)",
+                    field.name()
+                );
+            }
+            match fields.iter_mut().find(|f| f.name() == field.name()) {
+                Some(seen) if seen.data_type() != field.data_type() => {
+                    return plan_err!(
+                        "nutmeg: column `{}` is {} in some staged rows and {} in others; \
+                         canonical order sorts the whole part as one table, so cast one of \
+                         them, or stage with `{ORDER_OPTION}` = `asStaged`",
+                        field.name(),
+                        seen.data_type(),
+                        field.data_type()
+                    );
+                }
+                Some(seen) => {
+                    let nullable = seen.is_nullable() || field.is_nullable();
+                    seen.set_nullable(nullable);
+                }
+                None => fields.push(field.as_ref().clone()),
+            }
+        }
+    }
+    for field in &mut fields {
+        let everywhere = batches
+            .iter()
+            .all(|b| b.schema().column_with_name(field.name()).is_some());
+        if !everywhere && !field.name().starts_with("present.") {
+            field.set_nullable(true);
+        }
+    }
+    let schema = Arc::new(Schema::new(fields));
+    batches
+        .into_iter()
+        .map(|batch| {
+            let rows = batch.num_rows();
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|field| match batch.column_by_name(field.name()) {
+                    Some(column) => column.clone(),
+                    None if field.name().starts_with("present.") => {
+                        Arc::new(BooleanArray::from(vec![false; rows])) as ArrayRef
+                    }
+                    None => new_null_array(field.data_type(), rows),
+                })
+                .collect();
+            Ok(RecordBatch::try_new(schema.clone(), columns)?)
+        })
+        .collect()
+}
+
 /// One named graph: staged rows, and projections built from them.
 #[derive(Default)]
 struct Entry {
     nodes: Vec<RecordBatch>,
     edges: Vec<RecordBatch>,
+    /// Whether the whole edges part is in canonical order, so the nodes
+    /// derived from it (when no nodes are staged) are put in id order too.
+    edges_canonical: bool,
     revision: u64,
     projections: HashMap<String, GraphProjection>,
 }
@@ -541,12 +749,20 @@ impl Registry {
     /// `replace` discards that part's earlier rows. Nodes are optional: a
     /// graph staged from edges alone takes its nodes from their endpoints.
     /// Returns the rows now staged for that part.
+    ///
+    /// Under [`StageOrder::Canonical`] the whole part — earlier rows kept by
+    /// an append, and these — is sorted afterwards, so the part is the same
+    /// whatever order its rows and its appends arrived in. Under
+    /// [`StageOrder::AsStaged`] these rows are added after the earlier ones in
+    /// the order given, and the part is no longer canonical until a canonical
+    /// write sorts it again.
     pub fn stage(
         name: &str,
         part: Part,
         batches: &[RecordBatch],
         mapping: &ColumnMapping,
         replace: bool,
+        order: StageOrder,
     ) -> Result<usize> {
         let normalized: Vec<RecordBatch> = batches
             .iter()
@@ -562,11 +778,19 @@ impl Registry {
             Part::Nodes => &mut e.nodes,
             Part::Edges => &mut e.edges,
         };
-        if replace {
-            rows.clear();
+        // Built aside and swapped in, so a write the sort refuses leaves the
+        // staged rows as they were. Cloning batches clones only their handles.
+        let mut staged = if replace { Vec::new() } else { rows.clone() };
+        staged.extend(normalized);
+        let canonical = order == StageOrder::Canonical;
+        if canonical {
+            staged = canonicalize(part, staged)?;
         }
-        rows.extend(normalized);
+        *rows = staged;
         let total = rows.iter().map(|b| b.num_rows()).sum();
+        if part == Part::Edges {
+            e.edges_canonical = canonical;
+        }
         e.revision += 1;
         e.projections.clear();
         Ok(total)
@@ -605,7 +829,7 @@ impl Registry {
         let e = entry.read().map_err(|_| poisoned())?;
         let edges: usize = e.edges.iter().map(|b| b.num_rows()).sum();
         let nodes = if e.nodes.is_empty() {
-            derive_nodes(&e.edges)?.num_rows()
+            derive_nodes(&e.edges, e.edges_canonical)?.num_rows()
         } else {
             e.nodes.iter().map(|b| b.num_rows()).sum()
         };
@@ -624,7 +848,7 @@ impl Registry {
         };
         let e = entry.read().map_err(|_| poisoned())?;
         if e.nodes.is_empty() {
-            Ok(vec![derive_nodes(&e.edges)?])
+            Ok(vec![derive_nodes(&e.edges, e.edges_canonical)?])
         } else {
             Ok(e.nodes.clone())
         }
@@ -644,7 +868,7 @@ impl Registry {
         }
         let derived;
         let nodes: &[RecordBatch] = if e.nodes.is_empty() {
-            derived = [derive_nodes(&e.edges)?];
+            derived = [derive_nodes(&e.edges, e.edges_canonical)?];
             &derived
         } else {
             &e.nodes
@@ -675,8 +899,11 @@ impl Registry {
     }
 }
 
-/// Distinct edge endpoints in first-appearance order, as a node batch.
-fn derive_nodes(edges: &[RecordBatch]) -> Result<RecordBatch> {
+/// Distinct edge endpoints as a node batch: in id order when the edges are
+/// canonical, so a graph staged from edges alone projects its nodes in the
+/// order the same nodes staged explicitly would take; otherwise in the order
+/// they first appear among the edges.
+fn derive_nodes(edges: &[RecordBatch], sorted: bool) -> Result<RecordBatch> {
     let mut seen: HashSet<&str> = HashSet::new();
     let mut ids: Vec<&str> = Vec::new();
     for batch in edges {
@@ -698,6 +925,9 @@ fn derive_nodes(edges: &[RecordBatch]) -> Result<RecordBatch> {
                 }
             }
         }
+    }
+    if sorted {
+        ids.sort_unstable();
     }
     let rows = ids.len();
     Ok(RecordBatch::try_new(
@@ -984,6 +1214,14 @@ fn probe_args(algorithm: &str, orientation: Option<&str>) -> Result<ValidatedArg
     if let Some(orientation) = orientation {
         options.insert("orientation".into(), serde_json::json!(orientation));
     }
+    probe_args_with(algorithm, options)
+}
+
+/// [`probe_args`] on top of the given options.
+fn probe_args_with(
+    algorithm: &str,
+    mut options: serde_json::Map<String, serde_json::Value>,
+) -> Result<ValidatedArguments> {
     let definition = definition_of(algorithm)?;
     // Successive node arguments name different probe nodes: a kernel that takes
     // a source and a target, such as max flow, refuses the same node twice.
@@ -1134,6 +1372,7 @@ pub fn output_schema(algorithm: &str) -> Result<SchemaRef> {
             &[edges],
             &ColumnMapping::default(),
             true,
+            StageOrder::Canonical,
         )?;
         Registry::stage(
             PROBE,
@@ -1141,6 +1380,7 @@ pub fn output_schema(algorithm: &str) -> Result<SchemaRef> {
             &[probe_nodes()?],
             &ColumnMapping::default(),
             true,
+            StageOrder::Canonical,
         )?;
     }
     let (_, batches) = probe(algorithm)?;

@@ -289,6 +289,16 @@ run. During development, two runs of the unsorted staging gave modularity
 sorted by station. Two consecutive runs of the captured script then gave
 identical community tables.
 
+That workaround is no longer needed, and the script no longer has it.
+Nutmeg now sorts every staged graph into a canonical order by default (the
+`order` write option; see the top-level README), so Leiden runs on the
+tutorial's graph from Step 2 as staged. The numbers above were produced by
+the old script, which sorted station ids as numbers. Canonical order compares
+ids as text, so the node order differs, and the next run may find a
+different partition and modularity from those recorded here. That run has
+not been made yet. What the change guarantees is that two runs on the same
+trips agree with each other.
+
 **Geographic check.** Trips are the only input to the graph, which has no
 coordinates. If the communities are real, stations close together should
 land in the same community:

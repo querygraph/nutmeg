@@ -58,6 +58,60 @@ whole client) renames those columns, from the cited table
 `nutmeg_graph::GDS_COLUMN_ALIASES`. Only names change: where GDS's row shape
 differs from Grust's, it still does.
 
+## Row order
+
+Grust's kernels are deterministic for a given input, but row order is part
+of the input. Projection rows follow the order nodes are staged in, or, when
+only edges are staged, the order ids first appear among the edges. Adjacency
+follows edge order. Leiden and Louvain visit nodes in that order, and label
+propagation breaks ties by it. The order also decides which of several
+equal-cost paths is reported, how components and colours are labelled, and
+the order of floating-point sums. A DataFrame's row order is not fixed, and
+Sail's scan order changes from run to run. In the Citi Bike example, the
+same query gave Leiden modularity 0.4398 in one run and 0.4389 in another.
+
+So staging keeps each graph in a **canonical order** by default: the write
+option `order` = `canonical`, or `project(..., order="canonical")` in the
+Python client. After every write, the whole part is sorted, including rows
+kept from earlier `append` writes, so neither the order of the rows nor the
+order of the appends changes a result:
+
+- nodes by `node_id`. Grust refuses duplicate ids, so this is a total order
+  on every graph that can run. Nodes derived from edges alone are put in id
+  order as well.
+- edges by `source`, `target`, `edge_id` (nulls last), `label`, then every
+  other staged column by name. Two edges that tie on all of these are equal
+  in every column a kernel reads, so their relative order cannot change any
+  result. Parallel edges without an `edge_id` are still ordered, for
+  example by their weights.
+
+Ids are Utf8 once staged, so the order is text order: `"10"` sorts before
+`"9"`. Determinism only needs a total order, and no kernel reads the row
+order as a numeric one. It does mean the canonical order is not the order an
+`ORDER BY` on integer ids gives.
+
+`order` = `asStaged` keeps rows in arrival order with no sort. It is for
+callers who already guarantee an order or who want to skip the cost. An
+`asStaged` append leaves the part unsorted until the next canonical write,
+which sorts the whole part again. If appends of differently shaped
+DataFrames disagree on a column's type (for example `w` as an integer in one
+and a double in the next), there is no single sorted form, and a canonical
+write is refused with a message that names the column. Cast the column, or
+stage with `asStaged`.
+
+**Cost.** Each canonical write does an in-memory sort of every staged row of
+that part on the server, not only the new rows, while holding the graph's
+write lock. Rows are compared in Arrow's row format. Time is O(n log n) in
+the part's rows, so staging in k appends costs k such sorts. Peak memory is
+about twice the part, plus the sort keys (the key columns encoded) and 16
+bytes of permutation per row. For edges the keys are the ids, the type and
+the numeric properties. For nodes they are only the ids. Like staging
+itself, the sort is not charged against the projection's memory admission
+(`NUTMEG_MEMORY_BYTES`) or its work limit. That admission starts when a
+projection is built, and the staged rows, sorted or not, are held outside
+it. Stage a large graph in one write rather than many appends, or use
+`asStaged` if the order is already fixed.
+
 ## Sail
 
 Nutmeg builds against a Sail checkout at `../sail` (commit recorded in
