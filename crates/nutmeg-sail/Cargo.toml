@@ -16,5 +16,9 @@ datafusion-expr = { workspace = true }
 arrow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+sail-common = { workspace = true }
 sail-common-datafusion = { workspace = true }
 sail-session = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

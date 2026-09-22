@@ -24,11 +24,9 @@ fn nutmeg_session_factory(
     runtime: RuntimeHandle,
 ) -> Box<dyn SessionFactory<ServerSessionInfo>> {
     let spark = Box::new(SparkSessionMutator::new(config.clone()));
-    Box::new(ServerSessionFactory::new(
-        config,
-        runtime,
-        NutmegSessionMutator::wrap(spark),
-    ))
+    // `main` has checked `NUTMEG_READS` already, so this cannot fail.
+    let nutmeg = NutmegSessionMutator::wrap(spark, &config.mode).expect("NUTMEG_READS is valid");
+    Box::new(ServerSessionFactory::new(config, runtime, nutmeg))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     pyo3::Python::initialize();
     let config = Arc::new(AppConfig::load()?);
+    let reads = nutmeg_sail::read_execution(&config.mode)?;
     let runtime = RuntimeManager::try_new(&config.runtime)?;
     let handle = runtime.handle();
     runtime.handle().primary().block_on(async move {
@@ -55,8 +54,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         init_telemetry(&config.telemetry, &config.catalog.system, resource)?;
         let listener = TcpListener::bind((ip, port)).await?;
         eprintln!(
-            "nutmeg-server: Spark Connect on sc://{}",
-            listener.local_addr()?
+            "nutmeg-server: Spark Connect on sc://{} ({:?} mode, reads {:?})",
+            listener.local_addr()?,
+            config.mode,
+            reads
         );
         let signal = async {
             let _ = tokio::signal::ctrl_c().await;

@@ -4,12 +4,18 @@
 //! "pagerank")` runs one Grust algorithm on a staged graph and returns its
 //! rows. Every other option is Grust's configuration for that algorithm
 //! (`orientation`, `weightProperty`, `damping`, `source`, ...), validated by
-//! Grust. Without `algorithm` the read lists the staged graphs.
+//! Grust. Without `algorithm` the read lists the staged graphs. The one
+//! option that is Nutmeg's, `columnNames` (`grust`, the default, or `gds`),
+//! chooses whether result columns keep Grust's names or take GDS's where they
+//! differ (`nutmeg_graph::GDS_COLUMN_ALIASES`).
 //!
-//! One option is Nutmeg's rather than Grust's: `concurrency` says how many
-//! threads the kernel may use. Left out, the kernel runs on the calling thread,
-//! which is what a server with its own scheduler should get unless it asks
-//! otherwise.
+//! Nutmeg's other options are the read's own: `concurrency` says how many
+//! threads the kernel may use for this read, and `timeoutMs`, `workLimit` and
+//! `memoryLimitBytes` bound it (`nutmeg_graph::QueryLimits`). Without
+//! `concurrency` the kernel runs single-threaded, which is what a server with
+//! its own scheduler should get unless it asks otherwise; each read carries
+//! its own worker count, so one read asking for threads does not give them to
+//! another sharing the same cached projection.
 //!
 //! Write: `df.write.format("nutmeg").option("graph", "g").option("part",
 //! "edges")` stages the DataFrame's rows as the graph's edges (`part=nodes`
@@ -17,7 +23,10 @@
 //! grust-arrow layout are recognized as they are; other tables name their
 //! columns with `sourceColumn`, `targetColumn`, `typeColumn`, `edgeIdColumn`,
 //! `idColumn`, `labelColumn`. `mode("overwrite")` replaces that part;
-//! `append` adds to it.
+//! `append` adds to it. `order` is `canonical` (the default: the whole part,
+//! appends included, is kept sorted, so results do not depend on the order
+//! Sail's scan delivered the rows in) or `asStaged` (rows kept in arrival
+//! order, with no sort); see `nutmeg_graph::StageOrder`.
 //!
 //! This is the shape of Neo4j's Spark connector `gds` option and of Aura's
 //! project-then-run session, without a database or a second instance: the
@@ -28,13 +37,20 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::provider_as_source;
-use datafusion::execution::SessionStateBuilder;
-use datafusion::physical_plan::{ExecutionPlan, collect};
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::execution::{SessionStateBuilder, TaskContext};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+};
 use datafusion::prelude::SessionConfig;
 use datafusion_common::{Result, not_impl_err, plan_err};
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableSource, TableType};
-use nutmeg_graph::{AlgorithmTable, ColumnMapping, GraphsTable, Part, Registry};
+use futures::TryStreamExt;
+use nutmeg_graph::{
+    AlgorithmTable, ColumnMapping, GraphsTable, Part, ReadExecution, Registry, StageOrder,
+};
+use sail_common::config::ExecutionMode;
 use sail_common_datafusion::datasource::{
     DataSource, DataSourceRegistry, OptionLayer, SinkInfo, SinkMode, SourceInfo,
 };
@@ -97,11 +113,18 @@ impl DataSource for NutmegDataSource {
                 nutmeg_graph::algorithm_names()
             );
         };
-        // `concurrency` travels with the algorithm's options: it is Nutmeg's
-        // option, not Grust's, and AlgorithmTable takes it out before Grust
-        // validates the rest.
+        // `concurrency`, and a read's other limits, travel with the
+        // algorithm's options: they are Nutmeg's options, not Grust's, and
+        // `AlgorithmTable` takes them out before Grust validates the rest.
+        let names = match take(
+            &mut options,
+            &nutmeg_graph::COLUMN_NAMES_OPTION.to_ascii_lowercase(),
+        ) {
+            Some(text) => nutmeg_graph::ColumnNames::parse(&text)?,
+            None => nutmeg_graph::ColumnNames::Grust,
+        };
         let configuration = nutmeg_graph::options_from_strings(name, options)?;
-        let table = AlgorithmTable::new(name, graph, &configuration)?;
+        let table = AlgorithmTable::named(name, graph, &configuration, names)?;
         Ok(provider_as_source(Arc::new(table)))
     }
 
@@ -129,6 +152,13 @@ impl DataSource for NutmegDataSource {
             other => return plan_err!("nutmeg: `part` must be `nodes` or `edges`, got `{other}`"),
         };
         take(&mut options, "path");
+        let order = match take(
+            &mut options,
+            &nutmeg_graph::ORDER_OPTION.to_ascii_lowercase(),
+        ) {
+            Some(text) => StageOrder::parse(&text)?,
+            None => StageOrder::Canonical,
+        };
         let mut mapping = ColumnMapping::default();
         for (key, value) in options {
             if !mapping.set(&key, value) {
@@ -149,6 +179,7 @@ impl DataSource for NutmegDataSource {
             part,
             mapping,
             replace,
+            order,
             schema: Arc::new(input.schema().as_arrow().clone()),
         });
         let plan = LogicalPlanBuilder::insert_into(
@@ -162,13 +193,15 @@ impl DataSource for NutmegDataSource {
     }
 }
 
-/// The write target: collects the input's rows and stages them.
+/// The write target. Planning it yields a [`StageWriter`] that stages the
+/// input's rows when the plan runs.
 #[derive(Debug)]
 struct StageSink {
     graph: String,
     part: Part,
     mapping: ColumnMapping,
     replace: bool,
+    order: StageOrder,
     schema: arrow::datatypes::SchemaRef,
 }
 
@@ -192,46 +225,121 @@ impl TableProvider for StageSink {
         plan_err!("nutmeg: the write target is not readable; read with an `algorithm` option")
     }
 
+    /// Called by DataFusion's physical planner while it builds the plan, before
+    /// its physical optimizer has run over the whole tree. `input` is therefore
+    /// not yet runnable: a join in it still has `PartitionMode::Auto`, which
+    /// only the `JoinSelection` rule resolves. So nothing is executed here; the
+    /// returned `DataSinkExec` stages the rows when the optimized plan runs.
     async fn insert_into(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         _insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Sail plans this on the server; the rows are consumed here, in the
-        // process that owns the projection registry.
-        let batches = collect(input, state.task_ctx()).await?;
-        let rows = Registry::stage(
+        let sink = StageWriter {
+            graph: self.graph.clone(),
+            part: self.part,
+            mapping: self.mapping.clone(),
+            replace: self.replace,
+            order: self.order,
+            schema: self.schema.clone(),
+        };
+        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
+    }
+}
+
+/// The execution half of [`StageSink`]: receives the input's rows when the
+/// plan runs, in the process that owns the projection registry, and stages
+/// them. `DataSinkExec` asks for a single input partition and reports the
+/// returned row count as its `count` column, as DataFusion's own sinks do.
+#[derive(Debug)]
+struct StageWriter {
+    graph: String,
+    part: Part,
+    mapping: ColumnMapping,
+    replace: bool,
+    order: StageOrder,
+    schema: arrow::datatypes::SchemaRef,
+}
+
+impl DisplayAs for StageWriter {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "NutmegStage: graph={}, part={:?}", self.graph, self.part)
+    }
+}
+
+#[async_trait]
+impl DataSink for StageWriter {
+    fn schema(&self) -> &arrow::datatypes::SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        mut data: SendableRecordBatchStream,
+        _context: &Arc<TaskContext>,
+    ) -> Result<u64> {
+        // Fed a batch at a time, so Nutmeg's memory budget can refuse a write
+        // at the batch that would cross it, instead of after the whole
+        // DataFrame has been collected here.
+        let mut staging = Registry::staging(
             &self.graph,
             self.part,
-            &batches,
             &self.mapping,
             self.replace,
-        )? as u64;
-        // Report the staged row count the way DataFusion's sinks do.
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("count", arrow::datatypes::DataType::UInt64, false),
-        ]));
-        let batch = arrow::record_batch::RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(arrow::array::UInt64Array::from(vec![rows]))],
-        )?;
-        let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])?;
-        table.scan(state, None, &[], None).await
+            self.order,
+        );
+        while let Some(batch) = data.try_next().await? {
+            staging.push(&batch)?;
+        }
+        let rows = staging.finish()?;
+        Ok(rows as u64)
     }
 }
 
 /// Installs Nutmeg in every Sail session: the data source into the session's
-/// registry, the table functions into the session state. Wraps the mutator
-/// Sail would otherwise use so nothing of Sail's own setup changes.
+/// registry, the table functions into the session state, and the session's
+/// [`ReadExecution`]. Wraps the mutator Sail would otherwise use so nothing of
+/// Sail's own setup changes.
 pub struct NutmegSessionMutator {
     inner: Box<dyn ServerSessionMutator>,
+    reads: ReadExecution,
 }
 
 impl NutmegSessionMutator {
-    pub fn wrap(inner: Box<dyn ServerSessionMutator>) -> Box<dyn ServerSessionMutator> {
-        Box::new(Self { inner })
+    /// Nutmeg in every session of a server in `mode`, with reads executed as
+    /// [`read_execution`] chooses for it.
+    pub fn wrap(
+        inner: Box<dyn ServerSessionMutator>,
+        mode: &ExecutionMode,
+    ) -> Result<Box<dyn ServerSessionMutator>> {
+        Ok(Box::new(Self {
+            inner,
+            reads: read_execution(mode)?,
+        }))
     }
+}
+
+/// How reads run in a server in `mode`: as `NUTMEG_READS` says if it is set,
+/// otherwise streaming in local mode and materialised in either cluster mode.
+///
+/// In a cluster mode Sail's driver encodes every stage's physical plan to
+/// send it to a worker (`JobScheduler`, via `encode_remote_physical_plan`),
+/// and its codec (`RemoteExecutionCodec::try_encode`) refuses any node it does
+/// not know with `unsupported physical plan node`, which a streaming read's
+/// `NutmegAlgorithmExec` is. A materialised read plans an in-memory table,
+/// which it can encode. Note that staging does not work in a cluster mode
+/// either: the codec refuses the `DataSinkExec` of Nutmeg's writer (as
+/// `unsupported data sink node`), and a worker would not hold the driver's
+/// graphs if it did not. Nutmeg is a local-mode extension today.
+pub fn read_execution(mode: &ExecutionMode) -> Result<ReadExecution> {
+    if let Some(chosen) = ReadExecution::from_env()? {
+        return Ok(chosen);
+    }
+    Ok(match mode {
+        ExecutionMode::Local => ReadExecution::Streaming,
+        _ => ReadExecution::Materialized,
+    })
 }
 
 impl ServerSessionMutator for NutmegSessionMutator {
@@ -249,7 +357,7 @@ impl ServerSessionMutator for NutmegSessionMutator {
                 )
             })?;
         registry.register_data_source(Arc::new(NutmegDataSource))?;
-        Ok(config)
+        Ok(config.with_extension(Arc::new(self.reads)))
     }
 
     fn mutate_state(
@@ -268,5 +376,113 @@ impl ServerSessionMutator for NutmegSessionMutator {
         info: &ServerSessionInfo,
     ) -> Result<datafusion::execution::runtime_env::RuntimeEnvBuilder> {
         self.inner.mutate_runtime_env(builder, info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int32Array, StringArray, UInt64Array};
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use datafusion_expr::{JoinType, col};
+
+    fn table(name: &str, columns: [(&str, ArrayRef); 2]) -> Result<LogicalPlan> {
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|(n, a)| Field::new(*n, a.data_type().clone(), false))
+                .collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), columns.map(|(_, a)| a).to_vec())?;
+        let provider = MemTable::try_new(schema, vec![vec![batch]])?;
+        LogicalPlanBuilder::scan(name, provider_as_source(Arc::new(provider)), None)?.build()
+    }
+
+    type ArrayRef = Arc<dyn Array>;
+
+    /// A graph built the ordinary way: trips joined to stations, then staged.
+    /// With more than one target partition DataFusion plans the join as a
+    /// `HashJoinExec` in `PartitionMode::Auto`, which the `JoinSelection`
+    /// physical optimizer rule resolves. The sink used to execute its input
+    /// inside `insert_into`, during planning and before that rule ran, and
+    /// failed with "Invalid HashJoinExec, unsupported PartitionMode Auto in
+    /// execute()" — the Citi Bike example's failure, without Sail.
+    #[tokio::test]
+    async fn a_joined_dataframe_is_staged() -> Result<()> {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+        let trips = table(
+            "trips",
+            [
+                ("start", Arc::new(Int32Array::from(vec![1, 2, 2]))),
+                ("end", Arc::new(Int32Array::from(vec![2, 3, 1]))),
+            ],
+        )?;
+        let starts = table(
+            "starts",
+            [
+                ("id", Arc::new(Int32Array::from(vec![1, 2, 3]))),
+                ("source", Arc::new(StringArray::from(vec!["a", "b", "c"]))),
+            ],
+        )?;
+        let ends = table(
+            "ends",
+            [
+                ("id", Arc::new(Int32Array::from(vec![1, 2, 3]))),
+                ("target", Arc::new(StringArray::from(vec!["a", "b", "c"]))),
+            ],
+        )?;
+        let input = LogicalPlanBuilder::from(trips)
+            .join(
+                starts,
+                JoinType::Inner,
+                (vec!["trips.start"], vec!["starts.id"]),
+                None,
+            )?
+            .join(
+                ends,
+                JoinType::Inner,
+                (vec!["trips.end"], vec!["ends.id"]),
+                None,
+            )?
+            .project(vec![col("source"), col("target")])?
+            .build()?;
+        let info = SinkInfo {
+            input,
+            mode: SinkMode::Overwrite,
+            partition_by: vec![],
+            bucket_by: None,
+            sort_order: vec![],
+            options: vec![OptionLayer::OptionList {
+                items: vec![
+                    ("graph".into(), "joined".into()),
+                    ("part".into(), "edges".into()),
+                ],
+            }],
+            lakehouse_table: None,
+        };
+        let plan = NutmegDataSource.create_writer(&ctx.state(), info).await?;
+        let physical = ctx.state().create_physical_plan(&plan).await?;
+        let shown = datafusion::physical_plan::displayable(physical.as_ref())
+            .indent(false)
+            .to_string();
+        assert!(shown.contains("HashJoinExec"), "{shown}");
+        let batches = datafusion::physical_plan::collect(physical, ctx.task_ctx()).await?;
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, 3);
+        let staged = Registry::list()?
+            .into_iter()
+            .find(|g| g.name == "joined")
+            .expect("staged");
+        assert_eq!(staged.staged_edges, 3);
+        assert!(Registry::drop("joined")?);
+        Ok(())
     }
 }

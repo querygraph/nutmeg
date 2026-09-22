@@ -22,6 +22,8 @@ grust-algorithms = { workspace = true }
 grust-algorithm-procedures = { workspace = true }
 grust-procedures = { workspace = true }
 grust-core = { workspace = true }
+# The bounded channel a streaming read's kernel thread feeds.
+tokio = { workspace = true }
 
 [features]
 # The SQL surface, for tests that go through `ctx.sql`. Off by default because

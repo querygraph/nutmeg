@@ -3443,7 +3443,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "grust-algorithm-procedures"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "grust-algorithms",
  "grust-core",
@@ -3453,9 +3453,10 @@ dependencies = [
 
 [[package]]
 name = "grust-algorithms"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "arrow-array",
+ "arrow-schema",
  "grust-arrow",
  "grust-core",
  "grust-procedures",
@@ -3464,7 +3465,7 @@ dependencies = [
 
 [[package]]
 name = "grust-arrow"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3479,7 +3480,7 @@ dependencies = [
 
 [[package]]
 name = "grust-core"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "async-trait",
  "quick-xml 0.40.1",
@@ -3491,7 +3492,7 @@ dependencies = [
 
 [[package]]
 name = "grust-procedures"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "grust-core",
  "serde_json",
@@ -5590,8 +5591,10 @@ dependencies = [
  "datafusion-expr",
  "futures",
  "nutmeg-graph",
+ "sail-common",
  "sail-common-datafusion",
  "sail-session",
+ "tokio",
 ]
 
 [[package]]
@@ -7701,6 +7704,7 @@ dependencies = [
  "crc32fast",
  "datafusion",
  "datafusion-common",
+ "datafusion-datasource",
  "datafusion-expr",
  "datafusion-functions-nested",
  "datafusion-physical-expr",

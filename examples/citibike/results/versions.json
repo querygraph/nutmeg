@@ -1,0 +1,7 @@
+{
+  "nutmeg commit": "0480123994b67f32dc41c01d58aa914c8877fd3e",
+  "grust commit": "ca6890053fba0e1bb1b7581d876dd0a1d1ad7285",
+  "sail commit": "f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "host": "Linux 6.12.107+deb13-cloud-amd64 x86_64"
+}
