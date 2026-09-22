@@ -556,6 +556,11 @@ fn every_algorithm_reports_the_columns_its_scan_returns_under_either_naming() {
     }
 }
 
+// Needs DataFusion's SQL parser: `cargo test -p nutmeg-graph --features sql`.
+// The feature is off by default because DataFusion's `sql` feature adds an
+// error variant Sail's exhaustive match does not cover, so one cargo
+// invocation cannot build both it and `nutmeg-sail`.
+#[cfg(feature = "sql")]
 #[tokio::test]
 async fn gds_names_are_chosen_per_read_and_grust_names_stay_reachable() -> Result<()> {
     Registry::stage(
@@ -2021,6 +2026,11 @@ fn a_streamed_write_is_refused_at_the_batch_that_crosses_the_budget() {
     assert_eq!(info_of(&store, "streamed").unwrap().staged_bytes, 3 * held);
 }
 
+// Needs DataFusion's SQL parser: `cargo test -p nutmeg-graph --features sql`.
+// The feature is off by default because DataFusion's `sql` feature adds an
+// error variant Sail's exhaustive match does not cover, so one cargo
+// invocation cannot build both it and `nutmeg-sail`.
+#[cfg(feature = "sql")]
 /// The graph listing reports each graph's staged bytes, and `nutmeg_memory()`
 /// the budget, what is in use and the staged total, through SQL.
 #[tokio::test]
@@ -2543,6 +2553,7 @@ fn read_limits_are_read_options() {
             timeout: Some(Duration::from_millis(250)),
             work_units: Some(7),
             memory_bytes: Some(4_096),
+            concurrency: None,
         }
     );
     assert_eq!(options.keys().collect::<Vec<_>>(), ["damping"]);
@@ -2581,6 +2592,86 @@ fn read_limits_are_read_options() {
     let open = AlgorithmTable::new("pagerank", name.into(), &no_options()).unwrap();
     assert_eq!(open.batches().unwrap()[0].num_rows(), 3);
     assert!(Registry::drop(name).unwrap());
+}
+
+/// `concurrency` is one of those read options, and it is the read's: the
+/// kernel reads its worker count from the execution the read runs on, which
+/// is this read's child of the pool, not the shared projection's execution.
+#[test]
+fn concurrency_is_a_read_option_and_reaches_the_read_that_asked_for_it() {
+    let mut options = no_options();
+    options.insert(CONCURRENCY_OPTION.into(), serde_json::json!(8));
+    let mut taken = options.clone();
+    assert_eq!(QueryLimits::take(&mut taken).unwrap().concurrency, Some(8));
+    assert!(
+        taken.is_empty(),
+        "the option is consumed, not passed to Grust"
+    );
+
+    // Grust's validator would reject it, which is why it is taken out first.
+    assert!(validate("degree", &options).is_err());
+
+    // Zero threads is a mistake, not a way to ask for none.
+    let mut zero = no_options();
+    zero.insert(CONCURRENCY_OPTION.into(), serde_json::json!(0));
+    let error = QueryLimits::take(&mut zero).unwrap_err().to_string();
+    assert!(error.contains(CONCURRENCY_OPTION), "{error}");
+
+    let name = "concurrency-test";
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[edges(&["a", "b", "c"], &["b", "c", "a"], None)],
+        &ColumnMapping::default(),
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
+
+    // A read that asks for threads runs its kernel on an execution that has
+    // them; one that does not runs the code that predates them.
+    let asked = AlgorithmTable::new("degree", name.into(), &options).unwrap();
+    assert_eq!(asked.limits().concurrency, Some(8));
+    assert_eq!(asked.query().unwrap().context.concurrency(), 8);
+    assert_eq!(asked.batches().unwrap()[0].num_rows(), 3);
+    let plain = AlgorithmTable::new("degree", name.into(), &no_options()).unwrap();
+    assert_eq!(
+        plain.query().unwrap().context.concurrency_requested(),
+        None,
+        "a read that never asked for threads inherits none from the pool"
+    );
+    assert_eq!(plain.batches().unwrap()[0].num_rows(), 3);
+
+    // Both reads shared the one cached projection: the worker count is the
+    // read's, so it is not part of what the projection is keyed by.
+    let info = Registry::list()
+        .unwrap()
+        .into_iter()
+        .find(|graph| graph.name == name)
+        .unwrap();
+    assert_eq!(info.projections, 1);
+    assert!(Registry::drop(name).unwrap());
+}
+
+/// Nutmeg dispatches through Grust's own runner rather than a match arm per
+/// kernel, so the count below is not a list anyone maintains here. It exists
+/// to make the coverage visible: when Grust registers more, this number moves
+/// and nothing else has to.
+#[test]
+fn the_catalog_is_served_whole_and_is_larger_than_the_twelve() {
+    let names = algorithm_names();
+    assert!(
+        names.len() >= 30,
+        "Grust registers {} kernels: {names:?}",
+        names.len()
+    );
+    for name in &names {
+        let schema = output_schema(name).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert!(!schema.fields().is_empty(), "{name} produced no columns");
+    }
+    // And the SQL surface is one function per kernel, plus the three listings
+    // (`nutmeg_graphs`, `nutmeg_memory`, `nutmeg_reads`).
+    assert_eq!(table_functions().len(), names.len() + 3);
 }
 
 /// The reads of `graph` in [`Registry::reads`].
@@ -2625,6 +2716,11 @@ fn stage_ring(name: &str, n: usize) {
     .unwrap();
 }
 
+// Needs DataFusion's SQL parser: `cargo test -p nutmeg-graph --features sql`.
+// The feature is off by default because DataFusion's `sql` feature adds an
+// error variant Sail's exhaustive match does not cover, so one cargo
+// invocation cannot build both it and `nutmeg-sail`.
+#[cfg(feature = "sql")]
 /// Planning a read, and explaining it, run no kernel: the plan is a
 /// `NutmegAlgorithmExec`, and neither `execute` nor anything before the
 /// stream's first poll starts the read. Polling it runs it once.
@@ -2798,6 +2894,11 @@ async fn a_slow_consumer_holds_a_streaming_read_to_a_few_batches() -> Result<()>
     Ok(())
 }
 
+// Needs DataFusion's SQL parser: `cargo test -p nutmeg-graph --features sql`.
+// The feature is off by default because DataFusion's `sql` feature adds an
+// error variant Sail's exhaustive match does not cover, so one cargo
+// invocation cannot build both it and `nutmeg-sail`.
+#[cfg(feature = "sql")]
 /// A `LIMIT` ends the stream once it has its rows, and stops the read.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_limit_stops_the_read_once_it_has_its_rows() -> Result<()> {

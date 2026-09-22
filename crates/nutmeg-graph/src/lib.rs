@@ -1350,6 +1350,11 @@ impl Store {
                 memory_bytes: limits.memory_bytes,
                 work_units: limits.work_units.unwrap_or(usize::MAX),
                 deadline,
+                // A child is shared with its parent from birth, so its worker
+                // count is set here rather than with `with_concurrency`. The
+                // pool never asks for threads, so a read that does not either
+                // inherits none.
+                concurrency: limits.concurrency,
                 ..ChildLimits::default()
             })
             .map_err(|e| DataFusionError::Plan(format!("nutmeg: read limits: {e}")))?;
@@ -1726,17 +1731,26 @@ pub const WORK_LIMIT_OPTION: &str = "workLimit";
 /// within the process budget.
 pub const QUERY_MEMORY_OPTION: &str = "memoryLimitBytes";
 
+/// The read option that says how many threads a read's kernel may use.
+pub const CONCURRENCY_OPTION: &str = "concurrency";
+
 /// The options [`QueryLimits::take`] removes, which no kernel may declare.
-pub const QUERY_OPTIONS: [&str; 3] = [TIMEOUT_OPTION, WORK_LIMIT_OPTION, QUERY_MEMORY_OPTION];
+pub const QUERY_OPTIONS: [&str; 4] = [
+    TIMEOUT_OPTION,
+    WORK_LIMIT_OPTION,
+    QUERY_MEMORY_OPTION,
+    CONCURRENCY_OPTION,
+];
 
 /// Limits of one read's own, on top of the process budget.
 ///
 /// None is set by default: a read runs until it finishes, fails, or is
-/// cancelled ([`Query::cancel`]), bounded only by `NUTMEG_MEMORY_BYTES`. A
-/// read opts in with the read options `timeoutMs`, `workLimit` and
-/// `memoryLimitBytes`, which Nutmeg takes out before Grust validates the
-/// rest, like `columnNames`. Each limit stops that read alone; the process
-/// budget, the cached projection and every other read are untouched.
+/// cancelled ([`Query::cancel`]), bounded only by `NUTMEG_MEMORY_BYTES`, and
+/// its kernel runs single-threaded. A read opts in with the read options
+/// `timeoutMs`, `workLimit`, `memoryLimitBytes` and `concurrency`, which
+/// Nutmeg takes out before Grust validates the rest, like `columnNames`. Each
+/// limit stops that read alone; the process budget, the cached projection and
+/// every other read are untouched.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct QueryLimits {
     /// Wall time from the start of the read's run to its deadline.
@@ -1748,6 +1762,12 @@ pub struct QueryLimits {
     /// be built, a transpose a kernel caches — is the process's, not the
     /// read's, and does not count against this.
     pub memory_bytes: Option<usize>,
+    /// Threads the read's kernel may use. `None` runs the code that predates
+    /// threads, which is what a server with its own scheduler should get
+    /// unless it asks otherwise. It is the read's, not the projection's: the
+    /// kernel runs on a view of the cached projection bound to this read's
+    /// execution, so one read asking for threads gives none to another.
+    pub concurrency: Option<usize>,
 }
 
 impl QueryLimits {
@@ -1774,11 +1794,18 @@ impl QueryLimits {
                 _ => plan_err!("nutmeg: `{name}` must be a non-negative integer, got {value}"),
             }
         };
-        Ok(Self {
+        let limits = Self {
             timeout: take(TIMEOUT_OPTION)?.map(|ms| Duration::from_millis(ms as u64)),
             work_units: take(WORK_LIMIT_OPTION)?,
             memory_bytes: take(QUERY_MEMORY_OPTION)?,
-        })
+            concurrency: take(CONCURRENCY_OPTION)?,
+        };
+        // Grust's own rule: an execution runs on at least one thread, so zero
+        // is a mistake rather than a way to ask for none.
+        if limits.concurrency == Some(0) {
+            return plan_err!("nutmeg: `{CONCURRENCY_OPTION}` must be a positive integer, got 0");
+        }
+        Ok(limits)
     }
 }
 

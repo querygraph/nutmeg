@@ -1,13 +1,94 @@
-# diff between two consecutive runs of the same script (run 10 -> run 11, the captured run)
-65c65
-< | 55 | 1 | 9.69951240834e-09 | 774 | 1 |
+# three consecutive runs of the same script on grust (nutmeg cec3096, grust fd4e3ec, sail f1cf1729); run 3 is the captured run
+# run 1 start 2026-09-22T00:50:04Z end 2026-09-22T00:51:14Z exit 0
+# run 2 start 2026-09-22T00:51:14Z end 2026-09-22T00:52:22Z exit 0
+# run 3 start 2026-09-22T00:52:22Z end 2026-09-22T00:53:27Z exit 0
+
+## output.md, run 1 -> run 2 (empty: identical)
+
+## communities.png, run 1 -> run 2
+identical
+
+## results.json, run 1 -> run 2 (full precision; the report prints fewer digits)
+470c470
+<       "mean_minutes_in": 9.683683360258481,
 ---
-> | 55 | 1 | 9.6995114111e-09 | 774 | 1 |
-121c121
-< - Nutmeg, tolerance 1e-13 (114 iterations, converged True) vs NumPy reference: 774 nodes; max |diff| = 8.345e-14, L1 diff = 4.357e-13, max relative diff = 6.045e-11; top 10 same order: True; top 50 same order: True (same set: True)
+>       "mean_minutes_in": 9.68368336025848,
+490c490
+<       "mean_minutes_in": 8.45925690695459,
 ---
-> - Nutmeg, tolerance 1e-13 (114 iterations, converged True) vs NumPy reference: 774 nodes; max |diff| = 8.345e-14, L1 diff = 4.371e-13, max relative diff = 6.046e-11; top 10 same order: True; top 50 same order: True (same set: True)
-277c277
-< - NetworkX 3.7: max |diff| = 1.819e-12 over 761 nodes (largest score 28906.2); top 10 same order: True
+>       "mean_minutes_in": 8.459256906954588,
+500c500
+<       "mean_minutes_in": 8.422801650051564,
 ---
-> - NetworkX 3.7: max |diff| = 3.638e-12 over 761 nodes (largest score 28906.2); top 10 same order: True
+>       "mean_minutes_in": 8.422801650051566,
+542c542
+<       "mean_minutes_in": 24.682148997134664,
+---
+>       "mean_minutes_in": 24.682148997134668,
+552c552
+<       "mean_minutes_in": 25.26907258064516,
+---
+>       "mean_minutes_in": 25.269072580645165,
+572c572
+<       "mean_minutes_in": 20.13752398081535,
+---
+>       "mean_minutes_in": 20.137523980815352,
+612c612
+<       "mean_minutes_in": 17.786474226804124,
+---
+>       "mean_minutes_in": 17.786474226804117,
+669c669
+<       "mean_minutes_in": 11.4772555012225,
+---
+>       "mean_minutes_in": 11.477255501222501,
+687c687
+<       "mean_minutes_in": 12.678742572156201,
+---
+>       "mean_minutes_in": 12.6787425721562,
+696c696
+<       "mean_minutes_in": 11.306260228305886,
+---
+>       "mean_minutes_in": 11.306260228305884,
+
+## output.md, run 1 -> run 3 (empty: identical)
+
+## communities.png, run 1 -> run 3
+identical
+
+## results.json, run 1 -> run 3 (full precision; the report prints fewer digits)
+404c404
+<   "part2.corr_mean_minutes_vs_rise": 0.5364062638250638,
+---
+>   "part2.corr_mean_minutes_vs_rise": 0.5364062638250641,
+480c480
+<       "mean_minutes_in": 8.18817411402157,
+---
+>       "mean_minutes_in": 8.188174114021571,
+490c490
+<       "mean_minutes_in": 8.45925690695459,
+---
+>       "mean_minutes_in": 8.459256906954588,
+500c500
+<       "mean_minutes_in": 8.422801650051564,
+---
+>       "mean_minutes_in": 8.422801650051566,
+510c510
+<       "mean_minutes_in": 10.946242774566477,
+---
+>       "mean_minutes_in": 10.946242774566475,
+542c542
+<       "mean_minutes_in": 24.682148997134664,
+---
+>       "mean_minutes_in": 24.682148997134668,
+552c552
+<       "mean_minutes_in": 25.26907258064516,
+---
+>       "mean_minutes_in": 25.269072580645158,
+624c624
+<       "mean_minutes_in": 12.833404008506799,
+---
+>       "mean_minutes_in": 12.8334040085068,
+660c660
+<       "mean_minutes_in": 12.116566248256621,
+---
+>       "mean_minutes_in": 12.116566248256623,
