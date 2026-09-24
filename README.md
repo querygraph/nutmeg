@@ -43,9 +43,11 @@ machine's memory, and every staged graph is gone when the server restarts.
 
 **An existing Sail cluster → the client.** You pay a round trip: to run a
 kernel you pull the edge list (or a filtered projection of it) out of the
-server into your own process, and the result goes back the same way, subject
-to Spark Connect's message limits (`grust-sail` caps a bounded Arrow read at
-16 MiB per chunk). In exchange the server never has to know what a graph
+server into your own process, and the result goes back the same way, in
+Spark Connect responses — `grust-sail` sets its gRPC client's decoding limit
+to 16 MiB of Arrow payload plus 1 MiB of envelope
+(`MAX_ARROW_IPC_PAYLOAD_BYTES`), so a graph arrives as many responses rather
+than one. In exchange the server never has to know what a graph
 kernel is, so nothing about its topology matters.
 
 Two things about the client shape stated exactly, because it is easy to
