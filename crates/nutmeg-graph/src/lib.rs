@@ -2313,15 +2313,9 @@ fn conform(definition: &ProcedureDefinition, batch: RecordBatch) -> Result<Recor
     })
 }
 
-fn probe_args(algorithm: &str, orientation: Option<&str>) -> Result<ValidatedArguments> {
-    let mut options = serde_json::Map::new();
-    if let Some(orientation) = orientation {
-        options.insert("orientation".into(), serde_json::json!(orientation));
-    }
-    probe_args_with(algorithm, options)
-}
-
-/// [`probe_args`] on top of the given options.
+/// The arguments a schema probe runs with: the given options, plus a probe
+/// node for every positional argument and a probe column for every node
+/// property the kernel declares.
 fn probe_args_with(
     algorithm: &str,
     mut options: serde_json::Map<String, serde_json::Value>,
@@ -2427,20 +2421,56 @@ const PROBE: &str = "nutmeg.schema-probe";
 
 static SCHEMAS: Lazy<RwLock<HashMap<String, SchemaRef>>> = Lazy::new(Default::default);
 
-/// Run `algorithm` once on the probe graph, which must be staged, returning
-/// the arguments it ran with and its batches. A kernel defined on undirected
-/// graphs refuses the default directed projection, and says so; it is probed
-/// on an undirected one instead.
-fn probe(algorithm: &str) -> Result<(ValidatedArguments, Vec<RecordBatch>)> {
-    let args = probe_args(algorithm, None)?;
+/// Run `algorithm` once on the probe graph, which must be staged, on top of
+/// `options`, returning the arguments it ran with and its batches. A kernel
+/// defined on undirected graphs refuses the default directed projection, and
+/// says so; it is probed on an undirected one instead.
+fn probe(
+    algorithm: &str,
+    options: serde_json::Map<String, serde_json::Value>,
+) -> Result<(ValidatedArguments, Vec<RecordBatch>)> {
+    let args = probe_args_with(algorithm, options.clone())?;
     match run(algorithm, PROBE, &args) {
         Err(error) if error.to_string().contains("undirected") => {
-            let args = probe_args(algorithm, Some("undirected"))?;
+            let mut options = options;
+            options.insert("orientation".into(), serde_json::json!("undirected"));
+            let args = probe_args_with(algorithm, options)?;
             let batches = run(algorithm, PROBE, &args)?;
             Ok((args, batches))
         }
         other => Ok((args, other?)),
     }
+}
+
+/// The option through which a kernel is asked for the precision it keeps its
+/// scores in. It is Grust's own option, not one of Nutmeg's: `pagerank` and
+/// `articleRank` declare it in the registry, with `f64` as the default, so it
+/// reaches Grust's validator like `damping` and is refused there and in the
+/// kernel like any other bad option value. Nutmeg only has to read it back,
+/// because the `score` column's Arrow type follows it (`Float64` at `f64`,
+/// `Float32` at `f32`) and so must the schema a read reports.
+pub const PRECISION_OPTION: &str = "precision";
+
+/// The value of [`PRECISION_OPTION`] a call runs at, or `None` when the
+/// algorithm does not declare the option. Read from the validated arguments,
+/// so a call that does not name it gets Grust's declared default rather than
+/// one written down here.
+fn precision_of(algorithm: &str, args: &ValidatedArguments) -> Result<Option<String>> {
+    let resolved = PROCEDURES
+        .resolve(&format!("{PREFIX}{algorithm}"))
+        .map_err(err)?;
+    if !resolved
+        .definition()
+        .options
+        .iter()
+        .any(|option| option.field.name == PRECISION_OPTION)
+    {
+        return Ok(None);
+    }
+    Ok(match args.options().get(PRECISION_OPTION) {
+        Some(Value::String(text)) => Some(text.clone()),
+        _ => None,
+    })
 }
 
 /// The Arrow schema an algorithm's result has: the kernel's own column names
@@ -2453,9 +2483,32 @@ pub fn output_schema_named(algorithm: &str, names: ColumnNames) -> Result<Schema
     names.rename_schema(&output_schema(algorithm)?)
 }
 
-/// See [`output_schema_named`]; Grust's names.
+/// The schema a read with these validated arguments returns. An option can
+/// decide a column's Arrow type — [`PRECISION_OPTION`] decides `score`'s — so
+/// the schema is probed and cached per value of it, not per algorithm. Every
+/// other option leaves the result's types alone, so they do not enter the key.
+pub fn output_schema_for(
+    algorithm: &str,
+    args: &ValidatedArguments,
+    names: ColumnNames,
+) -> Result<SchemaRef> {
+    let precision = precision_of(algorithm, args)?;
+    names.rename_schema(&output_schema_at(algorithm, precision.as_deref())?)
+}
+
+/// See [`output_schema_named`]; Grust's names, at the declared default of
+/// every option.
 pub fn output_schema(algorithm: &str) -> Result<SchemaRef> {
-    if let Some(found) = SCHEMAS.read().map_err(|_| poisoned())?.get(algorithm) {
+    output_schema_at(algorithm, None)
+}
+
+fn output_schema_at(algorithm: &str, precision: Option<&str>) -> Result<SchemaRef> {
+    // `#` cannot occur in a registered algorithm name, so no key collides.
+    let key = match precision {
+        Some(value) => format!("{algorithm}#{PRECISION_OPTION}={value}"),
+        None => algorithm.to_string(),
+    };
+    if let Some(found) = SCHEMAS.read().map_err(|_| poisoned())?.get(&key) {
         return Ok(found.clone());
     }
     let mut schemas = SCHEMAS.write().map_err(|_| poisoned())?;
@@ -2487,11 +2540,15 @@ pub fn output_schema(algorithm: &str) -> Result<SchemaRef> {
             StageOrder::Canonical,
         )?;
     }
-    let (_, batches) = probe(algorithm)?;
+    let mut options = serde_json::Map::new();
+    if let Some(value) = precision {
+        options.insert(PRECISION_OPTION.into(), serde_json::json!(value));
+    }
+    let (_, batches) = probe(algorithm, options)?;
     let Some(first) = batches.first() else {
         return exec_err!("nutmeg: probing `{algorithm}` produced no batch");
     };
-    schemas.insert(algorithm.to_string(), first.schema());
+    schemas.insert(key, first.schema());
     Ok(first.schema())
 }
 
@@ -2535,13 +2592,17 @@ impl AlgorithmTable {
         };
         let mut options = options.clone();
         let limits = QueryLimits::take(&mut options)?;
+        let args = validate(algorithm, &options)?;
+        // The schema follows the call's options where one decides a column's
+        // Arrow type: `precision` decides `score`'s. See `output_schema_for`.
+        let schema = output_schema_for(algorithm, &args, names)?;
         Ok(Self {
             algorithm,
             graph,
-            args: Arc::new(validate(algorithm, &options)?),
+            args: Arc::new(args),
             names,
             limits,
-            schema: output_schema_named(algorithm, names)?,
+            schema,
         })
     }
 

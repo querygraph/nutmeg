@@ -1,5 +1,5 @@
 use super::*;
-use arrow::array::{Float64Array, Int32Array};
+use arrow::array::{Float32Array, Float64Array, Int32Array};
 use futures::StreamExt;
 use futures::TryStreamExt;
 use std::collections::BTreeSet;
@@ -526,7 +526,7 @@ fn every_algorithm_reports_the_columns_its_scan_returns_under_either_naming() {
     for definition in definitions() {
         let name = short(definition);
         output_schema(name).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let (args, _) = probe(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let (args, _) = probe(name, Default::default()).unwrap_or_else(|e| panic!("{name}: {e}"));
         let args = Arc::new(args);
         for names in [ColumnNames::Grust, ColumnNames::Gds] {
             let table = AlgorithmTable {
@@ -2644,6 +2644,217 @@ fn concurrency_is_a_read_option_and_reaches_the_read_that_asked_for_it() {
     assert!(Registry::drop(name).unwrap());
 }
 
+/// `precision` is Grust's own option on the two rank kernels, so it reaches
+/// the validator like `damping`. What Nutmeg owes it is the schema: the
+/// `score` column's Arrow type follows the declaration, so the schema a read
+/// reports has to be probed per value rather than per algorithm.
+#[test]
+fn precision_is_a_read_option_and_the_declared_schema_follows_it() {
+    let name = "precision-schema";
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[edges(&["a", "b", "c", "a"], &["b", "c", "a", "c"], None)],
+        &ColumnMapping::default(),
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
+
+    for algorithm in ["pagerank", "articleRank"] {
+        // Both rank kernels declare it, with `f64` as the default; no other
+        // kernel does, so nothing else is probed per value.
+        let declared = definitions()
+            .into_iter()
+            .find(|d| short(d) == algorithm)
+            .unwrap_or_else(|| panic!("{algorithm} is registered"))
+            .options
+            .iter()
+            .any(|option| option.field.name == PRECISION_OPTION);
+        assert!(declared, "{algorithm} declares `{PRECISION_OPTION}`");
+
+        for (asked, expected) in [
+            (None, DataType::Float64),
+            (Some("f64"), DataType::Float64),
+            (Some("f32"), DataType::Float32),
+        ] {
+            let mut options = no_options();
+            if let Some(asked) = asked {
+                options.insert(PRECISION_OPTION.into(), serde_json::json!(asked));
+            }
+            let table = AlgorithmTable::new(algorithm, name.into(), &options)
+                .unwrap_or_else(|e| panic!("{algorithm} {asked:?}: {e}"));
+            let score = table.schema.field_with_name("score").unwrap();
+            assert_eq!(
+                score.data_type(),
+                &expected,
+                "{algorithm} {asked:?}: the reported schema"
+            );
+            // `read_each` fails the read if a batch disagrees with the
+            // reported schema, so this also pins the two together.
+            let batches = table.batches().unwrap();
+            assert_eq!(batches[0].num_rows(), 3);
+            assert_eq!(
+                batches[0]
+                    .schema()
+                    .field_with_name("score")
+                    .unwrap()
+                    .data_type(),
+                &expected,
+                "{algorithm} {asked:?}: the batch"
+            );
+        }
+    }
+
+    // A kernel that declares no `precision` is unaffected, and its schema is
+    // still cached under its bare name.
+    let degree = AlgorithmTable::new("degree", name.into(), &no_options()).unwrap();
+    assert_eq!(degree.batches().unwrap()[0].num_rows(), 3);
+    assert!(
+        SCHEMAS.read().unwrap().contains_key("degree"),
+        "a kernel without the option keys on its name alone"
+    );
+    assert!(
+        SCHEMAS
+            .read()
+            .unwrap()
+            .contains_key(&format!("pagerank#{PRECISION_OPTION}=f32")),
+        "a kernel with it keys on the value too"
+    );
+
+    assert!(Registry::drop(name).unwrap());
+}
+
+/// A bad `precision` is refused the way any other bad option value is: by
+/// Grust, naming the option, before a single row is returned.
+#[test]
+fn a_bad_precision_is_refused_like_any_other_bad_option() {
+    let name = "precision-bad";
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[edges(&["a", "b", "c"], &["b", "c", "a"], None)],
+        &ColumnMapping::default(),
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
+
+    for bad in ["f16", "double", "F32", ""] {
+        let mut options = no_options();
+        options.insert(PRECISION_OPTION.into(), serde_json::json!(bad));
+        let error = AlgorithmTable::new("pagerank", name.into(), &options)
+            .err()
+            .unwrap_or_else(|| panic!("`{bad}` was accepted"))
+            .to_string();
+        assert!(error.contains(PRECISION_OPTION), "`{bad}`: {error}");
+        assert!(
+            error.contains("'f64'") && error.contains("'f32'"),
+            "`{bad}`: {error}"
+        );
+    }
+
+    // The same shape as a misspelled option name or a bad `orientation`:
+    // an error from the planner that names what was wrong.
+    let mut misspelled = no_options();
+    misspelled.insert("precison".into(), serde_json::json!("f32"));
+    let error = AlgorithmTable::new("pagerank", name.into(), &misspelled)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("precison"), "{error}");
+
+    // A non-string value is refused too, by the validator's type check.
+    let mut wrong_type = no_options();
+    wrong_type.insert(PRECISION_OPTION.into(), serde_json::json!(32));
+    assert!(AlgorithmTable::new("pagerank", name.into(), &wrong_type).is_err());
+
+    // And the option arrives from a data source as a lowercased string pair,
+    // keeping its spelling and its type.
+    let options = options_from_strings(
+        "pagerank",
+        [(PRECISION_OPTION.to_ascii_lowercase(), "f32".to_string())],
+    )
+    .unwrap();
+    assert_eq!(options[PRECISION_OPTION], serde_json::json!("f32"));
+
+    assert!(Registry::drop(name).unwrap());
+}
+
+/// The two precisions are the same algorithm at two widths, so their scores
+/// agree to about f32's own resolution. The tolerance below is stated rather
+/// than tuned: f32 carries ~7 decimal digits, and the scores here sum to 1
+/// over three nodes, so 1e-6 absolute is loose by about an order of
+/// magnitude and would still catch a kernel that ran a different iteration.
+#[test]
+fn f32_and_f64_scores_agree_within_f32_resolution() {
+    let name = "precision-agreement";
+    Registry::stage(
+        name,
+        Part::Edges,
+        &[edges(
+            &["a", "b", "c", "a", "b"],
+            &["b", "c", "a", "c", "a"],
+            None,
+        )],
+        &ColumnMapping::default(),
+        true,
+        StageOrder::Canonical,
+    )
+    .unwrap();
+
+    let scores = |precision: &str| -> Vec<f64> {
+        let mut options = no_options();
+        options.insert(PRECISION_OPTION.into(), serde_json::json!(precision));
+        let table = AlgorithmTable::new("pagerank", name.into(), &options).unwrap();
+        let batches = table.batches().unwrap();
+        let mut out = Vec::new();
+        for batch in &batches {
+            let column = batch.column_by_name("score").unwrap();
+            match column.data_type() {
+                DataType::Float64 => out.extend(
+                    column
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.unwrap()),
+                ),
+                DataType::Float32 => out.extend(
+                    column
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.unwrap() as f64),
+                ),
+                other => panic!("score is {other}"),
+            }
+        }
+        out
+    };
+
+    let wide = scores("f64");
+    let narrow = scores("f32");
+    assert_eq!(wide.len(), 3);
+    assert_eq!(narrow.len(), wide.len());
+    const TOLERANCE: f64 = 1e-6;
+    for (index, (wide, narrow)) in wide.iter().zip(&narrow).enumerate() {
+        assert!(
+            (wide - narrow).abs() <= TOLERANCE,
+            "node {index}: f64 {wide}, f32 {narrow}, tolerance {TOLERANCE}"
+        );
+    }
+    // And they are not the same numbers: f32 is a narrower computation, not
+    // an f64 one rounded at the end. (If this ever fails, the f32 path has
+    // stopped being separate and the option has stopped meaning anything.)
+    assert!(
+        wide.iter().zip(&narrow).any(|(w, n)| w != n),
+        "f32 produced bit-identical f64 scores"
+    );
+
+    assert!(Registry::drop(name).unwrap());
+}
+
 /// Nutmeg dispatches through Grust's own runner rather than a match arm per
 /// kernel, so the count below is not a list anyone maintains here. It exists
 /// to make the coverage visible: when Grust registers more, this number moves
@@ -2663,6 +2874,44 @@ fn the_catalog_is_served_whole_and_is_larger_than_the_twelve() {
     // And the SQL surface is one function per kernel, plus the three listings
     // (`nutmeg_graphs`, `nutmeg_memory`, `nutmeg_reads`).
     assert_eq!(table_functions().len(), names.len() + 3);
+}
+
+/// The README's catalog list is read back out of the file and compared with
+/// what is served. The list it replaced ("the twelve") went stale silently,
+/// which is the failure this prevents: when Grust registers a kernel, this
+/// fails and names it, rather than the page quietly becoming wrong.
+#[test]
+fn the_readmes_catalog_list_is_exactly_what_is_served() {
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))
+        .expect("the README is two directories above this crate");
+    let (_, after) = readme
+        .split_once("## The catalog")
+        .expect("the README has a `## The catalog` section");
+    let (section, _) = after.split_once("\n## ").unwrap_or((after, ""));
+    let listed: BTreeSet<String> = section
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|item| {
+            // The prose in the section also has backticked names that are not
+            // kernels; a kernel is a bare identifier that is actually served.
+            item.chars().all(|c| c.is_ascii_alphanumeric()) && resolve_algorithm(item).is_some()
+        })
+        .map(|item| item.to_string())
+        .collect();
+    let served: BTreeSet<String> = algorithm_names().iter().map(|n| n.to_string()).collect();
+    let missing: Vec<&String> = served.difference(&listed).collect();
+    assert!(
+        missing.is_empty(),
+        "the README's catalog list does not name {missing:?}"
+    );
+    // The stated count is the list's length, so the two cannot drift apart.
+    assert!(
+        section.contains(&format!("these {} —", served.len())),
+        "the README says a different number than the {} kernels served",
+        served.len()
+    );
+    assert_eq!(listed, served);
 }
 
 /// The reads of `graph` in [`Registry::reads`].

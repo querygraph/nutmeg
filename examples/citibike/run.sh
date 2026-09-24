@@ -7,8 +7,9 @@
 #   PYTHON=/path/to/venv/bin/python \
 #   examples/citibike/run.sh
 #
-# Nutmeg builds against sibling checkouts ../grust and ../sail (see the
-# repository README); their commits are recorded from there.
+# Grust and Sail are pinned in the workspace manifest (crates.io 0.23.0 and a
+# lakehq/sail revision); their pins are recorded from Cargo.lock and
+# SAIL_COMMIT, not from sibling checkouts, which a clean clone does not have.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -22,12 +23,15 @@ mkdir -p "$WORK" "$here/results"
 rm -rf "$WORK/delta"
 
 rev() { git -C "$1" rev-parse HEAD 2>/dev/null || echo unknown; }
+grust_version="$(awk '/^name = "grust-algorithms"$/{f=1} f&&/^version = /{gsub(/[^0-9.]/,"",$3); print $3; exit}' \
+  "$nutmeg_root/Cargo.lock" 2>/dev/null || echo unknown)"
 "$PYTHON" - "$here/results/versions.json" <<EOF
 import json, sys
 json.dump({
     "nutmeg commit": "$(rev "$nutmeg_root")",
-    "grust commit": "$(rev "$nutmeg_root/../grust")",
-    "sail commit": "$(rev "$nutmeg_root/../sail")",
+    "grust version": "$grust_version",
+    "grust tag commit": "$(cat "$nutmeg_root/GRUST_COMMIT" 2>/dev/null || echo unknown)",
+    "sail commit": "$(cat "$nutmeg_root/SAIL_COMMIT" 2>/dev/null || echo unknown)",
     "rustc": "$(rustc --version 2>/dev/null || echo unknown)",
     "host": "$(uname -srm)",
 }, open(sys.argv[1], "w"), indent=2)

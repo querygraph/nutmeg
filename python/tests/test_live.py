@@ -119,6 +119,50 @@ def test_the_order_option_reaches_the_server(nm):
         nm.graph.get(name).drop()
 
 
+def test_the_precision_option_reaches_the_server(nm):
+    # `precision` is Grust's own option on the two rank kernels. The score
+    # column's Arrow type follows it, so what the client sees is a Spark type:
+    # double at f64 (the default), float at f32.
+    spark = nm.spark
+    edges = spark.createDataFrame(
+        [("a", "b"), ("b", "c"), ("c", "a"), ("a", "c"), ("b", "a")],
+        "src string, dst string",
+    )
+    g = nm.graph.project("precision", edges, source="src", target="dst")
+
+    def scores(algorithm, **options):
+        df = getattr(nm, algorithm).stream(g, **options)
+        kind = dict(df.dtypes)["score"]
+        return kind, {r["nodeId"]: r["score"] for r in df.collect()}
+
+    for algorithm in ("pagerank", "articleRank"):
+        default_kind, wide = scores(algorithm)
+        assert default_kind == "double", f"{algorithm}: {default_kind}"
+        assert scores(algorithm, precision="f64")[0] == "double"
+        narrow_kind, narrow = scores(algorithm, precision="f32")
+        assert narrow_kind == "float", f"{algorithm}: {narrow_kind}"
+        # The same computation at two widths: they agree to about f32's own
+        # resolution. 1e-6 absolute is loose for scores that sum to 1 over
+        # three nodes, and still tight enough to catch a different kernel.
+        assert set(narrow) == set(wide)
+        for node in wide:
+            assert abs(wide[node] - narrow[node]) <= 1e-6, (algorithm, node, wide, narrow)
+
+    # Through Spark SQL the same option is a key in the JSON configuration.
+    sql = spark.sql(
+        "SELECT score FROM nutmeg_pagerank('precision', '{\"precision\": \"f32\"}')"
+    )
+    assert dict(sql.dtypes)["score"] == "float"
+
+    # A bad value is refused the way any other bad option value is, naming the
+    # option, before any row comes back.
+    with pytest.raises(Exception, match="precision"):
+        nm.pagerank.stream(g, precision="f16").collect()
+    with pytest.raises(Exception, match="precison"):
+        nm.pagerank.stream(g, precison="f32").collect()
+    g.drop()
+
+
 # Streaming reads. A read's kernel runs when the query executes, on a thread of
 # its own feeding a bounded channel, and dropping the execution's stream (which
 # is what Sail's interrupt does) cancels it. `nutmeg_reads()` shows each read's

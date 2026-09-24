@@ -7,6 +7,71 @@ gets DataFrames back — no separate graph database, no copy into a billed
 instance. The design and the Neo4j comparison it answers are in Grust's
 `docs/goals/sail-graph-analytics.md`.
 
+## Which of the two shapes you want
+
+Grust reaches Sail two ways. They share no code, they are deployed
+differently, and choosing between them is the first decision, not a detail.
+Grust's `GRUST-SAIL.md` calls them Path 2 and Path 1.
+
+**Nutmeg — the embedded shape, this repository.** `nutmeg-server` *is* the
+Sail Spark Connect server, with Nutmeg's data source and table functions
+registered in every session. A staged graph is Arrow memory in that process;
+a kernel reads it in place. Nothing crosses a process boundary: no edge list
+goes over a wire, no result comes back over one.
+
+**`grust-sail` — the client shape, in Grust.** A Spark Connect client that
+links no Sail crate at all. It speaks the same gRPC protocol PySpark speaks,
+to a **stock Sail server of any topology**, and needs no Sail change, no
+codec and no extension point. It keeps a graph in two ordinary Delta tables
+(`grust_nodes`, `grust_edges`), writes through staged Arrow IPC views and
+`MERGE INTO`, and reads results back as Arrow IPC.
+
+Choose like this:
+
+| | embed Nutmeg | use the `grust-sail` client |
+|---|---|---|
+| deployment | one machine, Sail in `local` mode | any Sail server, including one you do not control |
+| where a kernel runs | in the Sail process, on the staged Arrow | in **your** process, on a graph read out of Sail |
+| what crosses the wire | the result rows only | the graph (or the rows a pushed-down SQL query returns), then the result |
+| Sail change needed | one session-factory hook (upstream, #2630) | none |
+| cluster modes | **does not work** (see below) | not blocked by anything in Nutmeg's way |
+| graph survives a restart | no — staged graphs are process memory | yes — they are Delta tables |
+
+**One machine and speed → embed Nutmeg.** The edge list never moves and the
+kernel reads the staged Arrow directly, but you are bounded by that one
+machine's memory, and every staged graph is gone when the server restarts.
+
+**An existing Sail cluster → the client.** You pay a round trip: to run a
+kernel you pull the edge list (or a filtered projection of it) out of the
+server into your own process, and the result goes back the same way, subject
+to Spark Connect's message limits (`grust-sail` caps a bounded Arrow read at
+16 MiB per chunk). In exchange the server never has to know what a graph
+kernel is, so nothing about its topology matters.
+
+Two things about the client shape stated exactly, because it is easy to
+promise more than it does:
+
+- **`grust-sail` runs no graph kernel of its own, and pushes none into
+  Sail.** What it pushes down as SQL is degree aggregates, triplet joins,
+  traversals lowered from Grust's traversal IR, and the pushable subset of
+  read-only Cypher; variable-length paths are explicitly *not* pushed
+  (`SparkDialect::recursive_cte_supported` is `false` for Sail 0.7.1) and
+  fall back to reading the graph out. To run PageRank, Leiden or anything
+  else in `grust-algorithms` over Sail-held data, you read the graph into
+  your process (`read_graph`, `load_graph_arrow_ipc`, `query_arrow_ipc`) and
+  run the kernel there yourself. There is no algorithm API on `grust-sail`
+  today.
+- **"Works against a cluster" is an argument, not a measurement.**
+  `grust-sail` holds a client to one endpoint URL and sends ordinary Spark
+  SQL and `LocalRelation` temp views; it contains no Sail-internal plan node,
+  so none of the reasons Nutmeg fails in a cluster mode apply to it. But
+  every configured `grust-sail` test and benchmark in Grust runs against a
+  single-node `sail spark server`; there is no `local-cluster` or
+  `kubernetes-cluster` run of it recorded. Treat cluster support as
+  unobstructed rather than as verified.
+
+The rest of this page is about the embedded shape.
+
 ## Built on Grust's abstractions
 
 Nutmeg adds a way in and a way out, not a second graph library.
@@ -57,6 +122,31 @@ function's JSON configuration, or `Nutmeg(spark, column_names="gds")` for a
 whole client) renames those columns, from the cited table
 `nutmeg_graph::GDS_COLUMN_ALIASES`. Only names change: where GDS's row shape
 differs from Grust's, it still does.
+
+## Score precision
+
+`pagerank` and `articleRank` take Grust 0.23's `precision` option, `f64` (the
+default) or `f32`, and the `score` column's Arrow type follows it: Spark
+`double` at `f64`, `float` at `f32`.
+
+```python
+nm.pagerank.stream(g, precision="f32")            # score: float
+nm.article_rank.stream(g, precision="f64")        # score: double (the default)
+```
+
+```sql
+SELECT score FROM nutmeg_pagerank('g', '{"precision": "f32"}')
+```
+
+`precision` is Grust's own option, not one of Nutmeg's: it goes through the
+same registry validation as `damping`, and a value that is not `f64` or
+`f32` is refused at planning with a message naming the option, exactly as a
+bad `orientation` or a misspelled `dampng` is. What Nutmeg owes it is the
+schema. A read's schema is found by running the kernel once on a three-node
+probe graph, and that observation is now cached per value of `precision`
+rather than per algorithm, so the type a read *reports* is the type its
+batches carry. `f32` halves the score vector and its scratch; the scores
+agree with the `f64` ones to about f32's own resolution, not bit for bit.
 
 ## Row order
 
@@ -250,21 +340,23 @@ a local-mode extension today.
 
 ## Grust and Sail
 
-Nutmeg builds against sibling checkouts, `../grust` and `../sail`, as
-unpinned path dependencies: the workspace `Cargo.toml` names the paths and
-no version or revision, so a build takes whatever those checkouts are
-currently at. Nothing in the build checks them. The commits this head was
-built and tested against are recorded in two one-line files, and in the Citi
-Bike example's versions table:
+Both are pinned in the workspace `Cargo.toml`, so **a clean clone builds with
+no sibling checkouts**:
 
-| file | commit |
-|---|---|
-| `GRUST_COMMIT` | `ca68900` — `querygraph/grust` main: child executions, `with_execution`, `prepare_incoming`, Arrow declared nullability |
-| `SAIL_COMMIT` | `f1cf1729` — upstream `lakehq/sail` main, which contains the session-factory hook from #2630 |
+| dependency | pin | why this kind of pin |
+|---|---|---|
+| `grust-algorithms`, `grust-algorithm-procedures`, `grust-procedures`, `grust-core` | crates.io `0.23.0` ("Langoustine") | Grust publishes |
+| `sail-common`, `sail-common-datafusion`, `sail-telemetry`, `sail-session`, `sail-spark-connect` | git `lakehq/sail` rev `f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f` | Sail does not publish to crates.io — "There is no plan to publish it as Rust crates for use in other Rust projects" (lakehq/sail#1991) |
 
-Check the sibling checkouts out at those commits to reproduce a run. A
-published Grust release will replace the Grust path dependencies at the
-first Nutmeg release.
+`SAIL_COMMIT` is the revision the manifest pins. `GRUST_COMMIT` is the
+commit `querygraph/grust`'s `v0.23.0` tag names (`6504c0c`), which is what
+the published crates were cut from; the build resolves Grust by version, not
+by that commit. Both files are a record for a reader, not an input —
+nothing in the build reads either.
+
+Nutmeg's own workspace is `publish = false` and stays that way, because it
+compiles Sail's crates into its server. Nutmeg is released as a git tag, not
+to crates.io.
 
 Registering an external data source and table functions in a Sail session
 needs one hook: a way for an embedder to choose the session factory,
@@ -309,10 +401,26 @@ invocation that builds `nutmeg-graph`'s tests together with `nutmeg-sail`
 compile `sail-common-datafusion`; that is the expected outcome, not a
 regression, and the gate above is how the workspace is checked.
 
-## The twelve
+## The catalog
 
-`bfs`, `dfs`, `multiSourceBfs`, `dijkstra`, `shortestPaths`, `wcc`, `scc`,
-`pagerank`, `degree`, `topologicalSort`, `projectionStats`, `estimateCsr` —
-each with Grust's oracle-checked kernel, per-unit work charging, exact
-memory admission and cancellation. What Nutmeg needs next, and in what
-order, is recorded in Grust's `codex-to-codex.md` (2026-09-19 entry).
+Nutmeg serves whatever Grust's procedure registry holds, through Grust's own
+runner: there is no per-kernel match arm here, and a test fails when a
+registered kernel is not served. At Grust 0.23.0 that is these 41 —
+
+`allPairsShortestPaths`, `articleRank`, `articulationPoints`, `astar`,
+`bellmanFord`, `betweenness`, `bfs`, `biconnectedComponents`, `bridges`,
+`closeness`, `degree`, `dfs`, `dijkstra`, `eigenvector`, `estimateCsr`,
+`fastRP`, `harmonic`, `hits`, `k1Coloring`, `kCore`, `katz`,
+`labelPropagation`, `leiden`, `linkPrediction`,
+`localClusteringCoefficient`, `longestPath`, `louvain`, `maxFlow`, `minCut`,
+`modularity`, `multiSourceBfs`, `nodeSimilarity`, `pagerank`,
+`projectionStats`, `scc`, `shortestPaths`, `spanningTree`,
+`topologicalSort`, `triangleCount`, `wcc`, `yens`
+
+— a test reads that list back out of this file and fails if it is not
+exactly what Nutmeg serves, so it cannot go stale the way "the twelve" it
+replaces did. Each comes with Grust's oracle-checked kernel, per-unit work
+charging, exact
+memory admission and cancellation, and each reachable both as
+`spark.read.format("nutmeg")` and as `nutmeg_<name>(...)` in Spark SQL. A
+kernel Grust adds appears here by name with no change to this repository.

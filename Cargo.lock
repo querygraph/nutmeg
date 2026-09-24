@@ -3443,7 +3443,9 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "grust-algorithm-procedures"
-version = "0.22.0"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03a18567bd09e30ced2ae2316b9a07fc0a092758a34e9ec2699971c99e259af7"
 dependencies = [
  "grust-algorithms",
  "grust-core",
@@ -3453,7 +3455,9 @@ dependencies = [
 
 [[package]]
 name = "grust-algorithms"
-version = "0.22.0"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a81e8aae0c01384e8061dae52ac75cedaa06f343281b597662fa894bd87f9239"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -3465,7 +3469,9 @@ dependencies = [
 
 [[package]]
 name = "grust-arrow"
-version = "0.22.0"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18c142e7eef5f2d85eacf62bba03fe4059fb0565ebc0a6e738d82973b54e80c0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3480,7 +3486,9 @@ dependencies = [
 
 [[package]]
 name = "grust-core"
-version = "0.22.0"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52b731a341958672ec3474f7dc4b39190e5b54be155604ea4b7da8f03d3632e6"
 dependencies = [
  "async-trait",
  "quick-xml 0.40.1",
@@ -3492,7 +3500,9 @@ dependencies = [
 
 [[package]]
 name = "grust-procedures"
-version = "0.22.0"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81b22f57b59eca1ad700398e1490860781d59c467799e9169ec3093d47b92add"
 dependencies = [
  "grust-core",
  "serde_json",
@@ -7389,6 +7399,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "sail-build-scripts"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "lazy_static",
  "prettyplease 0.2.37",
@@ -7404,6 +7415,7 @@ dependencies = [
 [[package]]
 name = "sail-cache"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "chrono",
  "datafusion",
@@ -7420,6 +7432,7 @@ dependencies = [
 [[package]]
 name = "sail-catalog"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -7441,6 +7454,7 @@ dependencies = [
 [[package]]
 name = "sail-catalog-glue"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow",
  "async-trait",
@@ -7456,6 +7470,7 @@ dependencies = [
 [[package]]
 name = "sail-catalog-hms"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow",
  "async-trait",
@@ -7478,6 +7493,7 @@ dependencies = [
 [[package]]
 name = "sail-catalog-iceberg"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow",
  "async-trait",
@@ -7501,6 +7517,7 @@ dependencies = [
 [[package]]
 name = "sail-catalog-memory"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7511,6 +7528,7 @@ dependencies = [
 [[package]]
 name = "sail-catalog-onelake"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "async-trait",
  "object_store",
@@ -7525,6 +7543,7 @@ dependencies = [
 [[package]]
 name = "sail-catalog-system"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7543,6 +7562,7 @@ dependencies = [
 [[package]]
 name = "sail-catalog-unity"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow",
  "async-trait",
@@ -7563,6 +7583,7 @@ dependencies = [
 [[package]]
 name = "sail-celeborn"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -7585,6 +7606,7 @@ dependencies = [
 [[package]]
 name = "sail-common"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -7615,6 +7637,7 @@ dependencies = [
 [[package]]
 name = "sail-common-datafusion"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -7644,6 +7667,7 @@ dependencies = [
 [[package]]
 name = "sail-common-hms"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "pilota",
  "volo",
@@ -7654,6 +7678,7 @@ dependencies = [
 [[package]]
 name = "sail-data-source"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow",
  "arrow-pyarrow",
@@ -7696,6 +7721,7 @@ dependencies = [
 [[package]]
 name = "sail-delta-lake"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -7742,6 +7768,7 @@ dependencies = [
 [[package]]
 name = "sail-execution"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow-flight",
  "bytes",
@@ -7793,6 +7820,7 @@ dependencies = [
 [[package]]
 name = "sail-function"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -7839,6 +7867,7 @@ dependencies = [
 [[package]]
 name = "sail-iceberg"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "apache-avro",
  "arrow-schema",
@@ -7883,6 +7912,7 @@ dependencies = [
 [[package]]
 name = "sail-logical-optimizer"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "datafusion",
  "datafusion-common",
@@ -7892,6 +7922,7 @@ dependencies = [
 [[package]]
 name = "sail-logical-plan"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "comfy-table",
  "datafusion",
@@ -7908,6 +7939,7 @@ dependencies = [
 [[package]]
 name = "sail-object-store"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -7942,6 +7974,7 @@ dependencies = [
 [[package]]
 name = "sail-physical-optimizer"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "datafusion",
  "datafusion-physical-expr",
@@ -7952,6 +7985,7 @@ dependencies = [
 [[package]]
 name = "sail-physical-plan"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "datafusion",
  "datafusion-common",
@@ -7976,6 +8010,7 @@ dependencies = [
 [[package]]
 name = "sail-plan"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -8025,6 +8060,7 @@ dependencies = [
 [[package]]
 name = "sail-python-udf"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow-pyarrow",
  "datafusion",
@@ -8045,6 +8081,7 @@ dependencies = [
 [[package]]
 name = "sail-session"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "async-trait",
  "chrono",
@@ -8093,6 +8130,7 @@ dependencies = [
 [[package]]
 name = "sail-spark-connect"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow-schema",
  "async-stream",
@@ -8138,6 +8176,7 @@ dependencies = [
 [[package]]
 name = "sail-sql-analyzer"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "chrono",
  "chumsky 0.12.0",
@@ -8152,6 +8191,7 @@ dependencies = [
 [[package]]
 name = "sail-sql-macro"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8161,6 +8201,7 @@ dependencies = [
 [[package]]
 name = "sail-sql-parser"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "chumsky 0.12.0",
  "either",
@@ -8177,6 +8218,7 @@ dependencies = [
 [[package]]
 name = "sail-system-store"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "arrow-schema",
  "chrono",
@@ -8204,6 +8246,7 @@ dependencies = [
 [[package]]
 name = "sail-telemetry"
 version = "0.7.1"
+source = "git+https://github.com/lakehq/sail.git?rev=f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f#f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f"
 dependencies = [
  "chrono",
  "datafusion",

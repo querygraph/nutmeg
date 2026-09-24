@@ -38,11 +38,9 @@ during the run recorded there, and nothing below was typed in by hand.
 
 ## Running it
 
-Nutmeg builds against sibling checkouts `../grust` and `../sail`, as
-described in the repository README. For this run they were checked out at
-the commits above. The Nutmeg commit that adds this example also records
-Sail's commit in `SAIL_COMMIT` and in the one-line `Cargo.lock` change the
-newer Sail needs.
+Grust and Sail are pinned in the workspace manifest — crates.io `0.23.0` and
+a `lakehq/sail` revision — so a clean clone needs no sibling checkouts, and
+this run's components are exactly the pins above.
 
 ```sh
 cargo build --release -p nutmeg-server          # Sail is a large build; cap its memory and jobs

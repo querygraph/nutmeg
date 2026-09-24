@@ -36,21 +36,24 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 once_cell = "1"
 
-# Grust: the kernels, their admission and the Arrow contract. Path
-# dependencies on the sibling checkout while Nutmeg is developed against
-# unreleased Grust; a published version replaces these at the first release.
-grust-algorithms = { path = "../grust/crates/grust-algorithms", features = ["arrow"] }
-grust-algorithm-procedures = { path = "../grust/crates/grust-algorithm-procedures", features = ["arrow"] }
-grust-procedures = { path = "../grust/crates/grust-procedures" }
-grust-core = { path = "../grust/crates/grust-core" }
+# Grust: the kernels, their admission and the Arrow contract. Grust 0.23.0
+# "Langoustine" is on crates.io, so these are registry dependencies: a clean
+# clone of Nutmeg builds with no sibling `../grust` checkout.
+grust-algorithms = { version = "0.23.0", features = ["arrow"] }
+grust-algorithm-procedures = { version = "0.23.0", features = ["arrow"] }
+grust-procedures = { version = "0.23.0" }
+grust-core = { version = "0.23.0" }
 
-# Sail: the data-source contract and the session factory. Path dependencies
-# on the sibling checkout, pinned by the commit recorded in README.md.
-sail-common = { path = "../sail/crates/sail-common" }
-sail-common-datafusion = { path = "../sail/crates/sail-common-datafusion" }
-sail-telemetry = { path = "../sail/crates/sail-telemetry" }
-sail-session = { path = "../sail/crates/sail-session" }
-sail-spark-connect = { path = "../sail/crates/sail-spark-connect" }
+# Sail: the data-source contract and the session factory. Sail does not
+# publish to crates.io, so these are pinned to one upstream revision of
+# `lakehq/sail` — the commit recorded in `SAIL_COMMIT`, which is on
+# `lakehq/sail` main and carries the session-factory hook from #2630. A
+# clean clone builds from that revision with no sibling `../sail` checkout.
+sail-common = { git = "https://github.com/lakehq/sail.git", rev = "f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f" }
+sail-common-datafusion = { git = "https://github.com/lakehq/sail.git", rev = "f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f" }
+sail-telemetry = { git = "https://github.com/lakehq/sail.git", rev = "f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f" }
+sail-session = { git = "https://github.com/lakehq/sail.git", rev = "f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f" }
+sail-spark-connect = { git = "https://github.com/lakehq/sail.git", rev = "f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f" }
 
 [profile.release]
 codegen-units = 16
