@@ -4,8 +4,9 @@ Graph analytics inside Sail: Grust's graph kernels as a Spark data source
 and as SQL table functions, so a Spark Connect client projects a graph from
 any DataFrame Sail can read, runs algorithms in the engine's process, and
 gets DataFrames back — no separate graph database, no copy into a billed
-instance. The design and the Neo4j comparison it answers are in Grust's
-`docs/goals/sail-graph-analytics.md`.
+instance. Grust's `GRUST-SAIL.md` has the design and every Sail-side change
+it needs; the Neo4j comparison it answers is worked through end to end in
+[`examples/citibike`](examples/citibike/README.md).
 
 ## Which of the two shapes you want
 
@@ -89,12 +90,14 @@ Nutmeg adds a way in and a way out, not a second graph library.
   options (`orientation`, `nodeLabels`, `relationshipTypes`,
   `weightProperty`, `defaultWeight`). Other tables are renamed into that
   layout when staged.
-- **The stored graph and the Rust client are grust-sail's.** A Grust graph
-  kept in Sail by `SailGraphStore` (`grust_nodes`, `grust_edges`) is staged
-  with one call and never leaves the server;
-  `SailGraphStore::stage_algorithm_graph` and `run_algorithm` are the Rust
-  client, built on grust-sail's general `read_format_arrow_ipc` and
-  `write_query_to_format`.
+- **The stored graph is grust-sail's.** A Grust graph that `SailGraphStore`
+  keeps in Sail's catalog (`grust_nodes`, `grust_edges`) is staged into
+  Nutmeg with one call, in the server, and never leaves it:
+  `Nutmeg.graph.project_grust(name)` selects those two tables into the
+  projection's shape and stages the rows. `grust-sail` itself offers no
+  algorithm API — it reads a graph out (`read_graph`, `load_graph_arrow_ipc`,
+  `query_arrow_ipc`) for a caller to run kernels on in its own process. That
+  is the other shape, above.
 
 ## Layout
 
