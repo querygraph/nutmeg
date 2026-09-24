@@ -1,6 +1,6 @@
 # Nutmeg 0.1.0: graph algorithms where the data already is
 
-![Nutmeg 0.1.0 cover image](assets/nutmeg-cover.png)
+![A brass steampunk refinery above a river valley, captioned "Nutmeg — a Grust-Sail bridge for graph algorithms on Sail tables". Crates ride conveyor belts into the plant, a constellation of linked nodes glows on one vessel and arcs over the roofline, and three ornamental panels show an edge table, a node table and a list of algorithms with run times. The panels are decoration; their numbers are invented and none is a measurement.](assets/nutmeg-cover.png)
 
 Neo4j's own tutorial, [Aura Graph Analytics with Spark](https://neo4j.com/docs/graph-data-science-client/current/tutorials/graph-analytics-serverless-spark/), is a clear and complete piece of documentation, and it is the reference this project follows step by step rather than a target. It takes a month of Citi Bike trips held in Spark, projects an edge list out of them, ships that edge list over Arrow Flight into a separate graph session, runs PageRank there, and streams the scores back into Spark. Every step is necessary given where the algorithm lives. The analysis itself is a function over an edge list.
 
