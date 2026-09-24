@@ -27,14 +27,14 @@ during the run recorded there, and nothing below was typed in by hand.
 
 | component | version |
 |---|---|
-| grust commit | ca6890053fba0e1bb1b7581d876dd0a1d1ad7285 (`querygraph/grust` main; recorded in `GRUST_COMMIT`) |
-| nutmeg commit | 0480123994b67f32dc41c01d58aa914c8877fd3e (`integration/nutmeg-0.1`, the integrated head; these results are committed on top of it) |
-| sail commit | f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f (upstream `lakehq/sail` main, which contains the session-factory hook from #2630; recorded in `SAIL_COMMIT`) |
+| grust version | 0.23.0 from crates.io, cut from tag `v0.23.0` = 6504c0c050c01071ffc67724e80f124e07ffa5dc (recorded in `GRUST_COMMIT`) |
+| nutmeg commit | fb2af3ad0ec742eba3bba1327f4644080b3c3a36 (these results are committed on top of it) |
+| sail commit | f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f (upstream `lakehq/sail` main, which contains the session-factory hook from #2630; recorded in `SAIL_COMMIT`, and the revision the manifest pins) |
 | pyspark (client) | 4.2.0 (`pyspark-client`) |
 | server Spark version (spark.version) | 4.2.0 |
-| python (client) | 3.13.5 |
-| rustc | rustc 1.98.1 (48a229cea 2026-09-01) |
-| host | Linux 6.12.107+deb13-cloud-amd64 x86_64 |
+| python (client) | 3.13.14 |
+| rustc | rustc 1.97.1 (8bab26f4f 2026-07-14) |
+| host | Darwin 25.2.0 arm64 |
 
 ## Running it
 
@@ -88,7 +88,7 @@ transfer of the edges or of the results to another service, no credentials
 and no session lifetime. The one copy is inside the Sail process. Staging
 copies the projected rows into Nutmeg's in-memory graph registry, and the
 kernels build their CSR from that copy. For the tutorial's graph this run
-reports `csrBytes` = 25531544 (Step 2). This run used a single local Sail
+reports `csrBytes` = 19147108 (Step 2). This run used a single local Sail
 server. Where staging happens when Sail runs distributed has not been
 checked here.
 
@@ -116,7 +116,7 @@ failure and then gives the same eleven columns explicitly.
 
 | nodes | edges | arcs | selfLoops | csrBytes |
 |---|---|---|---|---|
-| 774 | 1595334 | 1595334 | 26234 | 25531544 |
+| 774 | 1595334 | 1595334 | 26234 | 19147108 |
 
 **Step 3: PageRank.** It converged in 55 iterations, with a last L1 change
 of 9.69950689892e-09 and scores summing to 1 over 774 nodes. The result
@@ -190,7 +190,7 @@ Observed agreement, over all 774 stations:
 What these results show:
 
 - The NumPy reference ran until its L1 change was below 1e-14. It stopped
-  after 127 iterations with a last change of 8.784e-15.
+  after 127 iterations with a last change of 8.778e-15.
 - **The default run agrees with the reference within the error its stopping
   rule allows.** Each PageRank step is a contraction with factor 0.85 in L1.
   So a last L1 change of 9.6995e-09 bounds the L1 distance to the fixed point
@@ -268,7 +268,7 @@ its rise in rank is 0.536. Waterfront and park-edge destinations reached by
 long rides gain, and neighbourhood stations served by short hops lose.
 
 **Reference check.** The NumPy reference ran on the CSV with durations
-summed per pair (116 iterations, last L1 change 9.195e-15). Over 772
+summed per pair (116 iterations, last L1 change 9.193e-15). Over 772
 stations it agrees with Nutmeg's default run to a max abs diff of 7.640e-09
 and an L1 diff of 3.899e-08. The top 10 and top 50 are in the same order.
 Two stations drop out of this graph because all their trips are over 180
@@ -305,10 +305,11 @@ That run staged the trips a second time, sorted by station id **as a
 number**, and found 8 communities with modularity 0.441135661. Canonical
 order compares ids as text (`"10"` before `"9"`), so Leiden visits the nodes
 in a different order and finds a different partition of almost the same
-quality. Checked on this build, outside the captured run: staging the trips
-sorted numerically with `order` = `asStaged` gives 0.441135661455 again, and
-staging them in descending order with the default canonical order gives the
-captured partition exactly. Between the two partitions, 10 of 774 stations
+quality. Checked outside the captured run, on Grust `ca68900` — the build
+that preceded 0.23.0, on which the captured partition is the same one:
+staging the trips sorted numerically with `order` = `asStaged` gives
+0.441135661455 again, and staging them in descending order with the default
+canonical order gives the captured partition exactly. Between the two partitions, 10 of 774 stations
 change community: 8 move from the downtown community to the midtown one
 (among them W 21 St & 6 Ave, which was downtown's highest-PageRank
 station), 1 from the uptown community to midtown and 1 from midtown to

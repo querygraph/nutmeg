@@ -26,9 +26,22 @@ Everything else follows from the lock file: DataFusion 55.1, Arrow 59,
 Sail 0.7.1. `GRUST_COMMIT` and `SAIL_COMMIT` are a record for a reader;
 nothing in the build reads them.
 
-The gate below was run against exactly those pins, as was the Citi Bike
-example's rerun; the example's `results/versions.json` records the run's own
-component versions.
+The gate below was run against exactly those pins, and so was the Citi Bike
+example, whose `results/` were recaptured on them: three consecutive runs
+gave the same `output.md` byte for byte and the same `communities.png`, and
+`results.json` differed only in the last digits of `mean_minutes_in`, which
+is a Sail SQL `AVG` and not a Nutmeg result.
+
+Against the previously captured run (Grust `ca68900`, on Linux), **every
+value Nutmeg produces is unchanged**, including Leiden's
+0.44082808748357094 and all eight communities, PageRank's agreement with the
+NumPy reference (max |diff| 4.841e-09 at the default tolerance, 8.345e-14 at
+1e-13), betweenness against NetworkX (3.638e-12) and A\*/Dijkstra
+(12914.980413 m). One Nutmeg-reported number did move, and it is a real
+change in Grust 0.23: `projectionStats`'s `csrBytes` for the same graph fell
+from 25531544 to 19147108, and for the link graph from 1139376 to 853008 —
+the CSR itself is about a quarter smaller. The other differences are in the
+NumPy/NetworkX reference implementations, recomputed on a different machine.
 
 ### Score precision on the rank kernels
 

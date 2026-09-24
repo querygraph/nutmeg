@@ -1,6 +1,6 @@
 {
   "part1.check.collapsed": {
-    "l1_diff": 0.26338668482410055,
+    "l1_diff": 0.2633866848241005,
     "max_abs_diff": 0.004210411635722151,
     "max_rel_diff": 3.0644036351275403,
     "nodes": 774,
@@ -10,7 +10,7 @@
     "top50_same_set": false
   },
   "part1.check.default": {
-    "l1_diff": 3.6739258843184776e-08,
+    "l1_diff": 3.673925883548694e-08,
     "max_abs_diff": 4.8413700548533e-09,
     "max_rel_diff": 3.507349550142627e-06,
     "nodes": 774,
@@ -20,9 +20,9 @@
     "top50_same_set": true
   },
   "part1.check.networkx_vs_numpy": {
-    "l1_diff": 2.8655073106009787e-13,
-    "max_abs_diff": 5.514816034390968e-14,
-    "max_rel_diff": 3.995388679153145e-11,
+    "l1_diff": 2.865666688320334e-13,
+    "max_abs_diff": 5.514837718434418e-14,
+    "max_rel_diff": 3.995405341324226e-11,
     "nodes": 774,
     "top10_same_order": true,
     "top10_same_set": true,
@@ -30,7 +30,7 @@
     "top50_same_set": true
   },
   "part1.check.tight": {
-    "l1_diff": 4.403981790791073e-13,
+    "l1_diff": 4.403766034558748e-13,
     "max_abs_diff": 8.344583704578135e-14,
     "max_rel_diff": 6.045168965528693e-11,
     "nodes": 774,
@@ -121,14 +121,14 @@
   "part1.projection_stats": [
     {
       "arcs": 1595334,
-      "csrBytes": 25531544,
+      "csrBytes": 19147108,
       "edges": 1595334,
       "nodes": 774,
       "selfLoops": 26234
     }
   ],
   "part1.reference": {
-    "final_l1_change": 8.784477052020678e-15,
+    "final_l1_change": 8.777809208659892e-15,
     "iterations": 127
   },
   "part1.rows": 1595334,
@@ -284,9 +284,9 @@
     "nutmeg": 0.44082808748357094
   },
   "part2.check.weighted": {
-    "l1_diff": 3.8994405904518425e-08,
-    "max_abs_diff": 7.640176057999506e-09,
-    "max_rel_diff": 5.66547522957114e-06,
+    "l1_diff": 3.8994405884514895e-08,
+    "max_abs_diff": 7.640176057565826e-09,
+    "max_rel_diff": 5.665475229249548e-06,
     "nodes": 772,
     "top10_same_order": true,
     "top10_same_set": true,
@@ -467,7 +467,7 @@
   "part2.station_metrics_rows": 774,
   "part2.weighted_fallers": [
     {
-      "mean_minutes_in": 9.683683360258481,
+      "mean_minutes_in": 9.68368336025848,
       "pagerank_minutes": 0.0010941218755679666,
       "pagerank_trips": 0.0019761450063787533,
       "rank_by_minutes": 356,
@@ -487,7 +487,7 @@
       "trips_in": 1298
     },
     {
-      "mean_minutes_in": 8.45925690695459,
+      "mean_minutes_in": 8.459256906954595,
       "pagerank_minutes": 0.0016225847634551524,
       "pagerank_trips": 0.002661240887464439,
       "rank_by_minutes": 218,
@@ -497,7 +497,7 @@
       "trips_in": 3149
     },
     {
-      "mean_minutes_in": 8.422801650051566,
+      "mean_minutes_in": 8.422801650051563,
       "pagerank_minutes": 0.0015725657740686544,
       "pagerank_trips": 0.0024467212406952947,
       "rank_by_minutes": 229,
@@ -507,7 +507,7 @@
       "trips_in": 2909
     },
     {
-      "mean_minutes_in": 10.946242774566477,
+      "mean_minutes_in": 10.946242774566473,
       "pagerank_minutes": 0.0012053894448727388,
       "pagerank_trips": 0.001873271582871661,
       "rank_by_minutes": 314,
@@ -519,7 +519,7 @@
   ],
   "part2.weighted_risers": [
     {
-      "mean_minutes_in": 25.112106084243365,
+      "mean_minutes_in": 25.112106084243372,
       "pagerank_minutes": 0.001279906952141898,
       "pagerank_trips": 0.000792359296664101,
       "rank_by_minutes": 290,
@@ -529,7 +529,7 @@
       "trips_in": 1282
     },
     {
-      "mean_minutes_in": 22.979288256227758,
+      "mean_minutes_in": 22.97928825622776,
       "pagerank_minutes": 0.0012988742284624842,
       "pagerank_trips": 0.000819704998605171,
       "rank_by_minutes": 289,
@@ -539,7 +539,7 @@
       "trips_in": 1405
     },
     {
-      "mean_minutes_in": 24.682148997134664,
+      "mean_minutes_in": 24.682148997134675,
       "pagerank_minutes": 0.001061761315248544,
       "pagerank_trips": 0.0006659688896128971,
       "rank_by_minutes": 372,
@@ -549,7 +549,7 @@
       "trips_in": 1047
     },
     {
-      "mean_minutes_in": 25.269072580645165,
+      "mean_minutes_in": 25.26907258064516,
       "pagerank_minutes": 0.0012689153082620717,
       "pagerank_trips": 0.0008610529780238861,
       "rank_by_minutes": 291,
@@ -559,7 +559,7 @@
       "trips_in": 1240
     },
     {
-      "mean_minutes_in": 20.31945652173913,
+      "mean_minutes_in": 20.319456521739134,
       "pagerank_minutes": 0.001135022389227029,
       "pagerank_trips": 0.0008218388026900025,
       "rank_by_minutes": 334,
@@ -569,7 +569,7 @@
       "trips_in": 1380
     },
     {
-      "mean_minutes_in": 20.13752398081535,
+      "mean_minutes_in": 20.13752398081534,
       "pagerank_minutes": 0.0013144816925822283,
       "pagerank_trips": 0.0009252995111537942,
       "rank_by_minutes": 283,
@@ -599,7 +599,7 @@
       "trips_in": 2439
     },
     {
-      "mean_minutes_in": 17.725796486977593,
+      "mean_minutes_in": 17.72579648697759,
       "pagerank_minutes": 0.0012481614528974555,
       "pagerank_trips": 0.0009532296486212269,
       "rank_by_minutes": 300,
@@ -621,7 +621,7 @@
   ],
   "part2.weighted_top10": [
     {
-      "mean_minutes_in": 12.833404008506799,
+      "mean_minutes_in": 12.833404008506792,
       "pagerank_minutes": 0.007144657280766019,
       "pagerank_trips": 0.006710352217707334,
       "rank_by_minutes": 1,
@@ -630,7 +630,7 @@
       "trips_in": 15517
     },
     {
-      "mean_minutes_in": 17.994255239520953,
+      "mean_minutes_in": 17.99425523952095,
       "pagerank_minutes": 0.006703935515771999,
       "pagerank_trips": 0.004715257478403381,
       "rank_by_minutes": 2,
@@ -639,7 +639,7 @@
       "trips_in": 10688
     },
     {
-      "mean_minutes_in": 12.14767727930536,
+      "mean_minutes_in": 12.147677279305354,
       "pagerank_minutes": 0.005092752363774329,
       "pagerank_trips": 0.004878337744521375,
       "rank_by_minutes": 3,
@@ -648,7 +648,7 @@
       "trips_in": 11056
     },
     {
-      "mean_minutes_in": 19.947474058280022,
+      "mean_minutes_in": 19.947474058280026,
       "pagerank_minutes": 0.004933659710937836,
       "pagerank_trips": 0.003220061077770546,
       "rank_by_minutes": 4,
@@ -657,7 +657,7 @@
       "trips_in": 7035
     },
     {
-      "mean_minutes_in": 12.116566248256623,
+      "mean_minutes_in": 12.116566248256621,
       "pagerank_minutes": 0.004896958779776224,
       "pagerank_trips": 0.00487662612226106,
       "rank_by_minutes": 5,
@@ -666,7 +666,7 @@
       "trips_in": 10755
     },
     {
-      "mean_minutes_in": 11.4772555012225,
+      "mean_minutes_in": 11.477255501222505,
       "pagerank_minutes": 0.00480390158339414,
       "pagerank_trips": 0.004893723736035624,
       "rank_by_minutes": 6,
@@ -675,7 +675,7 @@
       "trips_in": 11452
     },
     {
-      "mean_minutes_in": 14.074387343153305,
+      "mean_minutes_in": 14.074387343153306,
       "pagerank_minutes": 0.004525014288737455,
       "pagerank_trips": 0.003909371576141071,
       "rank_by_minutes": 7,
@@ -684,7 +684,7 @@
       "trips_in": 9165
     },
     {
-      "mean_minutes_in": 12.6787425721562,
+      "mean_minutes_in": 12.678742572156201,
       "pagerank_minutes": 0.004325506937753819,
       "pagerank_trips": 0.004112378461695079,
       "rank_by_minutes": 8,
@@ -693,7 +693,7 @@
       "trips_in": 9424
     },
     {
-      "mean_minutes_in": 11.306260228305884,
+      "mean_minutes_in": 11.306260228305888,
       "pagerank_minutes": 0.0042358128358670755,
       "pagerank_trips": 0.004331937010603996,
       "rank_by_minutes": 9,
@@ -702,7 +702,7 @@
       "trips_in": 9899
     },
     {
-      "mean_minutes_in": 17.064244457409572,
+      "mean_minutes_in": 17.06424445740956,
       "pagerank_minutes": 0.004212669789509721,
       "pagerank_trips": 0.003182174164511956,
       "rank_by_minutes": 10,
@@ -712,12 +712,13 @@
     }
   ],
   "versions": {
-    "grust commit": "ca6890053fba0e1bb1b7581d876dd0a1d1ad7285",
-    "host": "Linux 6.12.107+deb13-cloud-amd64 x86_64",
-    "nutmeg commit": "0480123994b67f32dc41c01d58aa914c8877fd3e",
+    "grust tag commit": "6504c0c050c01071ffc67724e80f124e07ffa5dc",
+    "grust version": "0.23.0",
+    "host": "Darwin 25.2.0 arm64",
+    "nutmeg commit": "fb2af3ad0ec742eba3bba1327f4644080b3c3a36",
     "pyspark (client)": "4.2.0",
-    "python (client)": "3.13.5",
-    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "python (client)": "3.13.14",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
     "sail commit": "f1cf1729b1d083f2b97f1ce6e68a0d92c5ccee8f",
     "server Spark version (spark.version)": "4.2.0"
   }
